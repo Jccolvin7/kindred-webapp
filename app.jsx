@@ -93,11 +93,13 @@ export default function KindredApp() {
       const fr = FILM.filter(f=>ratings.film[f.id]).map(f=>`${f.title}:${ratings.film[f.id]}/5`).join(', ');
       const gr = GAMES.filter(g=>ratings.games[g.id]).map(g=>`${g.title}:${ratings.games[g.id]}/5`).join(', ');
       const br = BOOKS.filter(b=>ratings.books[b.id]).map(b=>`${b.title}:${ratings.books[b.id]}/5`).join(', ');
-      const res = await fetch("https://api.anthropic.com/v1/messages",{
+      // NOTE: this now calls our own backend proxy (/api/chat) instead of
+      // Anthropic's API directly. The proxy holds the real API key on the
+      // server so it's never exposed in the browser.
+      const res = await fetch("/api/chat",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
         body:JSON.stringify({
-          model:"claude-sonnet-4-6", max_tokens:1000,
           messages:[{role:"user",content:`You are Kindred, a cross-domain taste matching platform. Generate exactly 6 personalized recommendations based on this user's ratings. Mix the types (film, show, game, book) based on their taste.
 
 Film ratings: ${fr||'none rated'}

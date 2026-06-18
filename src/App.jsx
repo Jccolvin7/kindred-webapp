@@ -85,37 +85,27 @@ function CompletionWidget({ ratings }) {
 
 export default function KindredApp() {
   const [step, setStep] = useState('welcome');
-
-  // --- AUTH STATE ---
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [userId, setUserId] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
-
-  // --- RATINGS STATE ---
   const [ratings, setRatings] = useState({film:{},games:{},books:{}});
   const [hoveredStar, setHoveredStar] = useState({});
-
-  // --- TWINS STATE (real, fetched from Supabase) ---
   const [realTwins, setRealTwins] = useState(null);
   const [twinsLoading, setTwinsLoading] = useState(false);
   const [twinsError, setTwinsError] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
-
-  // --- AI RECS STATE ---
   const [recs, setRecs] = useState(null);
   const [recError, setRecError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [procStage, setProcStage] = useState(0);
 
-  // Prefill email if they've signed in on this device before
   useEffect(() => {
     const saved = window.localStorage.getItem('kindred_email');
     if (saved) setEmail(saved);
   }, []);
 
-  // --- SIGN IN / SIGN UP ---
   async function handleAuth() {
     setAuthError(null);
     if (!email || !email.includes('@')) { setAuthError('Enter a valid email.'); return; }
@@ -124,7 +114,6 @@ export default function KindredApp() {
       const { data: existing, error: findErr } = await supabase
         .from('users').select('id, username').eq('email', email).maybeSingle();
       if (findErr) throw findErr;
-
       let uid;
       if (existing) {
         uid = existing.id;
@@ -136,8 +125,6 @@ export default function KindredApp() {
         if (insErr) throw insErr;
         uid = created.id;
       }
-
-      // Load any ratings they already saved previously
       const { data: existingTastes } = await supabase
         .from('tastes').select('category, item_name, rating').eq('user_id', uid);
       if (existingTastes && existingTastes.length) {
@@ -145,7 +132,6 @@ export default function KindredApp() {
         existingTastes.forEach(t => { if (loaded[t.category]) loaded[t.category][t.item_name] = t.rating; });
         setRatings(loaded);
       }
-
       window.localStorage.setItem('kindred_email', email);
       setUserId(uid);
       setStep('quiz_film');
@@ -155,7 +141,6 @@ export default function KindredApp() {
     setAuthLoading(false);
   }
 
-  // --- RATING (now writes to Supabase) ---
   async function setRating(domain, id, val) {
     const newVal = ratings[domain][id] === val ? undefined : val;
     setRatings(prev => ({...prev, [domain]: {...prev[domain], [id]: newVal}}));
@@ -174,21 +159,17 @@ export default function KindredApp() {
       } else {
         await supabase.from('tastes').insert({ user_id: userId, category: domain, item_name: id, rating: newVal });
       }
-    } catch (e) {
-      console.error('Save rating failed', e);
-    }
+    } catch (e) { console.error('Save rating failed', e); }
   }
 
   const rated = (d) => Object.values(ratings[d]).filter(Boolean).length;
 
-  // --- REAL TWIN MATCHING ---
   async function fetchRealTwins() {
     setTwinsLoading(true); setTwinsError(null);
     try {
       const { data: allTastes, error } = await supabase
         .from('tastes').select('user_id, category, item_name, rating');
       if (error) throw error;
-
       const mine = allTastes.filter(t => t.user_id === userId);
       const byUser = {};
       allTastes.forEach(t => {
@@ -196,7 +177,6 @@ export default function KindredApp() {
         if (!byUser[t.user_id]) byUser[t.user_id] = [];
         byUser[t.user_id].push(t);
       });
-
       const candidates = [];
       for (const otherId in byUser) {
         const theirs = byUser[otherId];
@@ -218,18 +198,14 @@ export default function KindredApp() {
         });
         candidates.push({ id: otherId, overall, domains, overlap: allSims.length });
       }
-
       candidates.sort((a,b) => b.overall - a.overall);
       const top = candidates.slice(0, 5);
-
-      // Work out shared favorites and items only one person rated, for the share card
       top.forEach(c => {
         const theirs = byUser[c.id];
         const theirMap = {};
         theirs.forEach(t => { theirMap[`${t.category}:${t.item_name}`] = t.rating; });
         const mineMap = {};
         mine.forEach(t => { mineMap[`${t.category}:${t.item_name}`] = t.rating; });
-
         const shared = [];
         mine.forEach(t => {
           const key = `${t.category}:${t.item_name}`;
@@ -238,17 +214,12 @@ export default function KindredApp() {
           }
         });
         shared.sort((a,b) => (b.mine+b.theirs) - (a.mine+a.theirs));
-
-        const onlyMine = mine.filter(t => theirMap[`${t.category}:${t.item_name}`] === undefined && t.rating >= 4)
-          .sort((a,b) => b.rating - a.rating);
-        const onlyTheirs = theirs.filter(t => mineMap[`${t.category}:${t.item_name}`] === undefined && t.rating >= 4)
-          .sort((a,b) => b.rating - a.rating);
-
+        const onlyMine = mine.filter(t => theirMap[`${t.category}:${t.item_name}`] === undefined && t.rating >= 4).sort((a,b) => b.rating - a.rating);
+        const onlyTheirs = theirs.filter(t => mineMap[`${t.category}:${t.item_name}`] === undefined && t.rating >= 4).sort((a,b) => b.rating - a.rating);
         c.shared = shared.slice(0, 4);
         c.onlyMine = onlyMine.slice(0, 4);
         c.onlyTheirs = onlyTheirs.slice(0, 4);
       });
-
       if (top.length) {
         const ids = top.map(c => c.id);
         const { data: userRows } = await supabase.from('users').select('id, username').in('id', ids);
@@ -256,7 +227,6 @@ export default function KindredApp() {
         userRows?.forEach(u => { nameMap[u.id] = u.username; });
         top.forEach(c => { c.handle = nameMap[c.id] ? `@${nameMap[c.id]}` : `@user_${c.id}`; });
       }
-
       setRealTwins(top);
     } catch (e) {
       setTwinsError('Could not load taste twins. Check your connection and try again.');
@@ -272,36 +242,17 @@ export default function KindredApp() {
     const lines = [];
     lines.push(`Kindred Taste Twin Match: ${twin.overall}%`);
     lines.push(`Matched with ${twin.handle}`);
-    if (twin.shared?.length) {
-      lines.push('');
-      lines.push('Shared favorites:');
-      twin.shared.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`));
-    }
-    if (twin.onlyMine?.length) {
-      lines.push('');
-      lines.push('Only I rated:');
-      twin.onlyMine.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`));
-    }
-    if (twin.onlyTheirs?.length) {
-      lines.push('');
-      lines.push(`Only ${twin.handle} rated:`);
-      twin.onlyTheirs.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`));
-    }
-    lines.push('');
-    lines.push('Find your taste twin at Kindred');
+    if (twin.shared?.length) { lines.push(''); lines.push('Shared favorites:'); twin.shared.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`)); }
+    if (twin.onlyMine?.length) { lines.push(''); lines.push('Only I rated:'); twin.onlyMine.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`)); }
+    if (twin.onlyTheirs?.length) { lines.push(''); lines.push(`Only ${twin.handle} rated:`); twin.onlyTheirs.forEach(s => lines.push(`- ${lookupTitle(s.category, s.item_name)}`)); }
+    lines.push(''); lines.push('Find your taste twin at Kindred');
     return lines.join('\n');
   }
 
   async function shareTwin(twin) {
     const text = buildShareText(twin);
-    if (navigator.share) {
-      try { await navigator.share({ text, title: 'My Kindred Taste Twin Match' }); return; } catch (e) { /* fall through to copy */ }
-    }
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedId(twin.id);
-      setTimeout(() => setCopiedId(null), 2000);
-    } catch (e) { /* clipboard unavailable, ignore quietly */ }
+    if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Twin Match' }); return; } catch (e) {} }
+    try { await navigator.clipboard.writeText(text); setCopiedId(twin.id); setTimeout(() => setCopiedId(null), 2000); } catch (e) {}
   }
 
   useEffect(() => {
@@ -328,6 +279,7 @@ export default function KindredApp() {
       const br = BOOKS.filter(b => ratings.books[b.id]).map(b => `${b.title}:${ratings.books[b.id]}/5`).join(', ');
       const res = await fetch("/api/chat", {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-6", max_tokens: 1000,
           messages: [{ role: "user", content: `You are Kindred, a cross-domain taste matching platform. Generate exactly 6 personalized recommendations based on this user's ratings. Mix the types (film, show, game, book) based on their taste.
@@ -379,7 +331,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     .auth-input:focus{border-color:#8B5CF6!important}
   `;
 
-  // WELCOME / LOGIN
   if (step === 'welcome') return (
     <div style={s.app}>
       <style>{FONTS + tagStyles}</style>
@@ -392,13 +343,10 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
           Someone who actually gets your taste in movies, shows, books, and games. Get recommendations from them — not an algorithm.
         </p>
         <div style={{maxWidth:340,width:'100%'}}>
-          <input className="auth-input" style={s.input} type="email" placeholder="your@email.com"
-            value={email} onChange={e=>setEmail(e.target.value)} />
-          <input className="auth-input" style={s.input} type="text" placeholder="Display name (optional)"
-            value={username} onChange={e=>setUsername(e.target.value)} />
+          <input className="auth-input" style={s.input} type="email" placeholder="your@email.com" value={email} onChange={e=>setEmail(e.target.value)} />
+          <input className="auth-input" style={s.input} type="text" placeholder="Display name (optional)" value={username} onChange={e=>setUsername(e.target.value)} />
           {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
-          <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s',fontSize:'1rem',opacity:authLoading?0.6:1}}
-            onClick={handleAuth} disabled={authLoading}>
+          <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s',fontSize:'1rem',opacity:authLoading?0.6:1}} onClick={handleAuth} disabled={authLoading}>
             {authLoading ? 'Signing in...' : 'Continue →'}
           </button>
         </div>
@@ -407,7 +355,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     </div>
   );
 
-  // QUIZ
   if (step.startsWith('quiz_')) {
     const domain = step.replace('quiz_','');
     const items = domain==='film'?FILM:domain==='games'?GAMES:BOOKS;
@@ -417,7 +364,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     const next = domain==='film'?'quiz_games':domain==='games'?'quiz_books':'processing';
     const num = domain==='film'?1:domain==='games'?2:3;
     const nextLabel = domain==='film'?'Next: Games →':domain==='games'?'Next: Books →':'Save & See Profile →';
-
     return (
       <div style={s.app}>
         <style>{FONTS + tagStyles}</style>
@@ -428,9 +374,7 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
             </div>
             <span style={{...s.mono,fontSize:'0.65rem',color:G.dim,whiteSpace:'nowrap'}}>{num} / 3</span>
           </div>
-
           <CompletionWidget ratings={ratings} />
-
           <div style={{marginBottom:'1.75rem'}}>
             <div style={{...s.eyebrow,color,display:'inline-block',background:`${color}18`,border:`1px solid ${color}30`,padding:'0.3rem 0.875rem',borderRadius:100,marginBottom:'1rem'}}>
               {icon} {label}
@@ -441,7 +385,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               <p style={{color:G.muted,fontSize:'0.88rem',lineHeight:1.65,marginTop:'0.5rem'}}>Rate as many as you recognize, skip the rest. The more you rate, the better your twin match.</p>
             )}
           </div>
-
           <div style={{display:'flex',flexDirection:'column',gap:'0.625rem',marginBottom:'1.75rem'}}>
             {items.map(item => {
               const userRating = ratings[domain][item.id] || 0;
@@ -474,7 +417,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               );
             })}
           </div>
-
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
             <span style={{color:G.dim,fontSize:'0.78rem',fontFamily:'Space Mono,monospace'}}>{rated(domain)} rated · saved</span>
             <button className="kindred-btn" style={{...s.btn,width:'auto',padding:'0.75rem 1.5rem',fontSize:'0.88rem',transition:'all 0.2s'}} onClick={()=>setStep(next)}>
@@ -486,7 +428,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     );
   }
 
-  // PROCESSING
   if (step === 'processing') {
     const stages = ['Analyzing taste fingerprint...','Mapping cross-domain patterns...','Saving your profile...','Almost there...'];
     return (
@@ -507,12 +448,10 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     );
   }
 
-  // PROFILE
   if (step === 'profile') {
     const total = rated('film') + rated('games') + rated('books');
     const avg = (d) => { const v=Object.values(ratings[d]).filter(Boolean); return v.length?v.reduce((a,b)=>a+b,0)/v.length:0; };
     const pct = (d) => Math.round(avg(d)*20);
-
     const tags = [];
     if ((ratings.film.interstellar>=4)||(ratings.film.blade2049>=4)||(ratings.film.her>=4)) tags.push('Sci-Fi Enthusiast');
     if ((ratings.games.disco>=4)||(ratings.games.eldenring>=4)) tags.push('Narrative Gamer');
@@ -521,7 +460,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
     if ((ratings.games.hades>=4)||(ratings.games.celeste>=4)) tags.push('Indie Game Lover');
     if ((ratings.books.road>=4)||(ratings.film.furyroad>=4)) tags.push('Post-Apocalyptic Aficionado');
     if (tags.length===0) tags.push('Eclectic Taste','Curious Explorer');
-
     return (
       <div style={s.app}>
         <style>{FONTS + tagStyles}</style>
@@ -531,9 +469,7 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
             <h2 style={s.h2}>Your taste profile</h2>
             <p style={{color:G.muted,fontSize:'0.85rem'}}>{total} items rated and saved to your account</p>
           </div>
-
           <CompletionWidget ratings={ratings} />
-
           <div style={{...s.card,marginBottom:'1rem'}}>
             <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'1.25rem'}}>Domain Breakdown</div>
             {[
@@ -557,7 +493,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               );
             })}
           </div>
-
           <div style={{...s.card,marginBottom:'1.25rem'}}>
             <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'1rem'}}>Taste Tags</div>
             <div style={{display:'flex',flexWrap:'wrap',gap:'0.5rem'}}>
@@ -566,14 +501,12 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               ))}
             </div>
           </div>
-
           <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('twins')}>Find My Taste Twins →</button>
         </div>
       </div>
     );
   }
 
-  // TWINS (real data from Supabase)
   if (step === 'twins') {
     const typeIconForDomain = {film:'🎬',games:'🎮',books:'📚'};
     return (
@@ -585,21 +518,18 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
             <h2 style={s.h2}>Your taste twins</h2>
             <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>Real users matched against your saved ratings.</p>
           </div>
-
           {twinsLoading && (
             <div style={{textAlign:'center',padding:'3rem 0'}}>
               <div style={{width:40,height:40,border:`2px solid ${G.border}`,borderTop:`2px solid ${G.cyan}`,borderRadius:'50%',animation:'spin 1s linear infinite',margin:'0 auto 1rem'}}/>
               <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.72rem',color:G.dim}}>Comparing your taste to everyone else's...</div>
             </div>
           )}
-
           {twinsError && (
             <div style={{background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.2)',borderRadius:14,padding:'1.25rem',textAlign:'center',marginBottom:'1.25rem'}}>
               <div style={{color:'#FCA5A5',marginBottom:'0.75rem',fontSize:'0.85rem'}}>{twinsError}</div>
               <button className="kindred-btn" style={{...s.btn,width:'auto',padding:'0.6rem 1.25rem',fontSize:'0.85rem',transition:'all 0.2s'}} onClick={fetchRealTwins}>Try Again</button>
             </div>
           )}
-
           {!twinsLoading && !twinsError && realTwins && realTwins.length===0 && (
             <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
               <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🔍</div>
@@ -607,16 +537,13 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody else has overlapping ratings with you yet. Invite friends to rate the same titles — the more people join, the better your matches get.</p>
             </div>
           )}
-
           {!twinsLoading && realTwins && realTwins.length>0 && (
             <div style={{display:'flex',flexDirection:'column',gap:'0.875rem',marginBottom:'1.25rem'}}>
               {realTwins.map(twin => (
                 <div key={twin.id} className="twin-card" style={{...s.card,transition:'all 0.2s',cursor:'default'}}>
                   <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'1.25rem'}}>
                     <div style={{display:'flex',alignItems:'center',gap:'0.875rem'}}>
-                      <div style={{width:44,height:44,borderRadius:'50%',background:'rgba(139,92,246,0.15)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.15rem',flexShrink:0}}>
-                        🧬
-                      </div>
+                      <div style={{width:44,height:44,borderRadius:'50%',background:'rgba(139,92,246,0.15)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.15rem',flexShrink:0}}>🧬</div>
                       <div>
                         <div style={{fontWeight:500,fontSize:'0.88rem'}}>{twin.handle}</div>
                         <div style={{color:G.dim,fontSize:'0.73rem',marginTop:'0.15rem'}}>{twin.overlap} items in common</div>
@@ -637,7 +564,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
                       )
                     ))}
                   </div>
-
                   {twin.shared?.length > 0 && (
                     <div style={{marginTop:'1rem'}}>
                       <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.5rem'}}>You both loved</div>
@@ -648,7 +574,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
                       </div>
                     </div>
                   )}
-
                   {((twin.onlyMine?.length > 0) || (twin.onlyTheirs?.length > 0)) && (
                     <div style={{marginTop:'0.875rem'}}>
                       <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.5rem'}}>Only one of you rated</div>
@@ -662,7 +587,6 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
                       </div>
                     </div>
                   )}
-
                   <button onClick={()=>shareTwin(twin)} style={{marginTop:'1rem',width:'100%',background:'transparent',border:`1px solid ${G.border}`,color:copiedId===twin.id?G.green:G.muted,padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
                     {copiedId===twin.id ? '✓ Copied — paste it anywhere' : '🔗 Share this match'}
                   </button>
@@ -670,14 +594,12 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
               ))}
             </div>
           )}
-
           <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('recs')}>Get AI Recommendations →</button>
         </div>
       </div>
     );
   }
 
-  // RECOMMENDATIONS
   if (step === 'recs') {
     const typeMap = {
       film:{label:'Film',color:G.purple,icon:'🎬'},
@@ -694,21 +616,18 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
             <h2 style={s.h2}>Made for your taste</h2>
             <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>Kindred analyzed your saved fingerprint across all domains.</p>
           </div>
-
           {loading && (
             <div style={{textAlign:'center',padding:'4rem 0'}}>
               <div style={{width:40,height:40,border:`2px solid ${G.border}`,borderTop:`2px solid ${G.purple}`,borderRadius:'50%',animation:'spin 1s linear infinite',margin:'0 auto 1rem'}}/>
               <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.72rem',color:G.dim}}>Generating recommendations...</div>
             </div>
           )}
-
           {recError && (
             <div style={{background:'rgba(239,68,68,0.08)',border:'1px solid rgba(239,68,68,0.2)',borderRadius:14,padding:'1.25rem',textAlign:'center',marginBottom:'1.25rem'}}>
               <div style={{color:'#FCA5A5',marginBottom:'0.75rem',fontSize:'0.85rem'}}>{recError}</div>
               <button className="kindred-btn" style={{...s.btn,width:'auto',padding:'0.6rem 1.25rem',fontSize:'0.85rem',transition:'all 0.2s'}} onClick={generateRecs}>Try Again</button>
             </div>
           )}
-
           {recs && (
             <>
               <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
@@ -730,12 +649,8 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
                 })}
               </div>
               <div style={{display:'grid',gridTemplateColumns:'1fr 2fr',gap:'0.75rem'}}>
-                <button className="out-btn" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setStep('quiz_film')}>
-                  Rate More
-                </button>
-                <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>{setRecs(null);generateRecs();}}>
-                  Refresh Recs ↺
-                </button>
+                <button className="out-btn" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setStep('quiz_film')}>Rate More</button>
+                <button className="kindred-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>{setRecs(null);generateRecs();}}>Refresh Recs ↺</button>
               </div>
             </>
           )}
@@ -746,4 +661,3 @@ Return ONLY a JSON object. No markdown, no backticks, no explanation. Format:
 
   return null;
 }
-

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { supabase } from "./supabaseClient";
+import Papa from "papaparse";
 
 const G = {
   bg:'#080B16', deep:'#0D1120', card:'rgba(255,255,255,0.04)',
@@ -16,6 +17,116 @@ const DOMAINS = [
   { key:'games', label:'Games',     icon:'🎮', color:G.cyan,   placeholder:'Search video games...'     },
   { key:'books', label:'Books',     icon:'📚', color:G.amber,  placeholder:'Search books...'           },
 ];
+
+// How many total ratings before we'll even attempt a twin match. Below this,
+// the pool of overlap is too thin to guarantee a match that actually feels good,
+// so we gate the reveal instead of showing a weak/empty result on day one.
+const TWIN_UNLOCK_THRESHOLD = 8;
+
+// Explorer level — purely a fun progression label based on total items rated.
+const LEVELS = [
+  { min: 0,  label: 'New Arrival' },
+  { min: 1,  label: 'Wanderer' },
+  { min: 5,  label: 'Explorer' },
+  { min: 15, label: 'Connoisseur' },
+  { min: 30, label: 'Taste Master' },
+];
+function getExplorerLevel(totalRated) {
+  let current = LEVELS[0];
+  for (const l of LEVELS) { if (totalRated >= l.min) current = l; }
+  return current.label;
+}
+
+// Archetype — a stable-per-person flavor adjective combined with their strongest
+// taste signal. Same person always gets the same adjective (seeded by their own
+// name/email), so it reads like an identity, not a random label that changes.
+const ARCHETYPE_ADJECTIVES = ['Reflective','Curious','Bold','Restless','Sharp-Eyed','Wandering','Discerning','Eclectic'];
+const ARCHETYPE_GENRES = {
+  'Sci-Fi Enthusiast': 'Sci-Fi',
+  'Narrative Gamer': 'Narrative',
+  'Avid Reader': 'Literary',
+  'Art House Fan': 'Art House',
+  'Indie Game Fan': 'Indie',
+  'Eclectic Taste': 'Genre-Blending',
+  'Curious Explorer': 'Genre-Blending',
+};
+function pickArchetype(seed, primaryTag) {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) % ARCHETYPE_ADJECTIVES.length;
+  const adjective = ARCHETYPE_ADJECTIVES[Math.abs(hash) % ARCHETYPE_ADJECTIVES.length];
+  const genre = ARCHETYPE_GENRES[primaryTag] || 'Genre-Blending';
+  return `${adjective} ${genre} Explorer`;
+}
+
+// Freshness — a lightweight, display-only placeholder for a future real decay
+// system. No timestamps tracked yet: it simply measures progress toward the
+// next 5-rating milestone, so it gives people a reason to keep adding ratings
+// without us having to build full time-based decay yet.
+function getFreshness(totalRated) {
+  if (totalRated === 0) return { pct: 0, remaining: 5 };
+  const intoCurrentBand = totalRated % 5;
+  if (intoCurrentBand === 0) return { pct: 100, remaining: 0 };
+  return { pct: Math.round((intoCurrentBand / 5) * 100), remaining: 5 - intoCurrentBand };
+}
+
+// Rare shared titles should count more toward a match than mainstream ones.
+// Weight runs from 0.3 (almost everyone has rated it) up to 3 (almost nobody else has).
+function computeRarityWeights(allTastes) {
+  const raterSets = {};
+  allTastes.forEach(t => {
+    const key = `${t.category}:${t.item_name}`;
+    if (!raterSets[key]) raterSets[key] = new Set();
+    raterSets[key].add(t.user_id);
+  });
+  const totalUsers = new Set(allTastes.map(t => t.user_id)).size;
+  const weights = {};
+  Object.keys(raterSets).forEach(key => {
+    const raterCount = raterSets[key].size;
+    const raw = Math.log((totalUsers + 1) / (raterCount + 1)) + 0.3;
+    weights[key] = Math.max(0.3, Math.min(3, raw));
+  });
+  return weights;
+}
+
+function buildWhyText(twin) {
+  if (!twin.shared || twin.shared.length === 0) return null;
+  const top = twin.shared.slice(0, 3).map(s => s.title);
+  if (top.length === 1) return `Matched mostly on ${top[0]} — not many people have rated that one.`;
+  const last = top.pop();
+  return `Matched mostly on ${top.join(', ')} and ${last} — rare picks that few others share.`;
+}
+
+// ─── IMPORT HELPERS ───────────────────────────────────────────
+// Letterboxd's export (ratings.csv or diary.csv) uses a 0.5–5.0 half-star
+// scale in a "Rating" column. We round to the nearest whole star since
+// Kindred only stores 1–5 integers.
+function parseLetterboxdCSV(text) {
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+  return parsed.data
+    .filter(row => row.Name && row.Rating && parseFloat(row.Rating) > 0)
+    .map(row => ({ title: row.Name.trim(), rating: Math.max(1, Math.min(5, Math.round(parseFloat(row.Rating)))) }));
+}
+
+// Goodreads' "My Rating" column is already 0–5 whole stars. 0 means unrated,
+// so those rows are skipped.
+function parseGoodreadsCSV(text) {
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+  return parsed.data
+    .filter(row => row['Title'] && row['My Rating'] && parseInt(row['My Rating'], 10) > 0)
+    .map(row => ({ title: row['Title'].trim(), rating: Math.max(1, Math.min(5, parseInt(row['My Rating'], 10))) }));
+}
+
+// Steam has no ratings at all — only playtime. This is a rough, clearly-
+// labeled estimate: more time invested generally means more enjoyed. Under
+// 30 minutes returns 0, meaning "not enough signal, skip this one."
+function playtimeToStars(minutes) {
+  const hours = minutes / 60;
+  if (hours < 0.5) return 0;
+  if (hours < 2) return 2;
+  if (hours < 8) return 3;
+  if (hours < 25) return 4;
+  return 5;
+}
 
 function CompletionWidget({ ratings }) {
   const perDomain = {};
@@ -54,12 +165,24 @@ export default function KindredApp() {
   const [userId, setUserId] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
+  const [subscribeEmail, setSubscribeEmail] = useState(true);
 
   const [ratings, setRatings] = useState({film:{},games:{},books:{}});
   const [quizDomain, setQuizDomain] = useState('film');
   const [searchQuery, setSearchQuery] = useState({film:'',games:'',books:''});
   const [searchResults, setSearchResults] = useState({film:[],games:[],books:[]});
   const [searchLoading, setSearchLoading] = useState({film:false,games:false,books:false});
+
+  // IMPORT
+  const [importTab, setImportTab] = useState('letterboxd');
+  const [importPreview, setImportPreview] = useState(null);
+  const [importStatus, setImportStatus] = useState(null);
+  const [steamInput, setSteamInput] = useState('');
+  const [steamLoading, setSteamLoading] = useState(false);
+  const [steamError, setSteamError] = useState(null);
+  const [steamGames, setSteamGames] = useState(null);
+  const [steamMode, setSteamMode] = useState('auto');
+  const [steamManualRatings, setSteamManualRatings] = useState({});
   const [hoveredStar, setHoveredStar] = useState({});
 
   const [realTwins, setRealTwins] = useState(null);
@@ -107,6 +230,27 @@ export default function KindredApp() {
   }
 
   // AUTH
+  // ─── LIGHTWEIGHT ANALYTICS ───────────────────────────────────
+  // Plain rows in an `events` table — no dashboard, just data you can query.
+  // Takes an explicit uid (not the userId state) so it's safe to call in the
+  // same tick a user is created, before state has caught up.
+  async function logEvent(uid, eventType, detail) {
+    if (!uid) return;
+    try { await supabase.from('events').insert({ user_id: uid, event_type: eventType, detail: detail || null }); } catch (e) {}
+  }
+  async function logEventOnce(uid, eventType, detail) {
+    if (!uid) return;
+    try {
+      const { data: existing } = await supabase.from('events').select('id')
+        .eq('user_id', uid).eq('event_type', eventType).limit(1).maybeSingle();
+      if (existing) return;
+      await supabase.from('events').insert({ user_id: uid, event_type: eventType, detail: detail || null });
+    } catch (e) {}
+  }
+  async function touchLastActive(uid) {
+    try { await supabase.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', uid); } catch (e) {}
+  }
+
   async function handleAuth() {
     setAuthError(null);
     if (!email || !email.includes('@')) { setAuthError('Enter a valid email.'); return; }
@@ -121,11 +265,13 @@ export default function KindredApp() {
       } else {
         const { data: created, error: insErr } = await supabase
           .from('users')
-          .insert({ email, username: username || email.split('@')[0] })
+          .insert({ email, username: username || email.split('@')[0], subscribe_weekly_email: subscribeEmail })
           .select('id').single();
         if (insErr) throw insErr;
         uid = created.id;
+        logEvent(uid, 'signup_completed');
       }
+      touchLastActive(uid);
       const { data: saved } = await supabase
         .from('tastes').select('category, item_name, rating').eq('user_id', uid);
       if (saved && saved.length) {
@@ -147,6 +293,7 @@ export default function KindredApp() {
     const newVal = ratings[domain][title] === val ? undefined : val;
     setRatings(prev => ({...prev, [domain]: {...prev[domain], [title]: newVal}}));
     if (!userId) return;
+    if (newVal !== undefined) touchLastActive(userId);
     try {
       if (newVal === undefined) {
         await supabase.from('tastes').delete()
@@ -167,6 +314,63 @@ export default function KindredApp() {
   const rated = (d) => Object.values(ratings[d]).filter(Boolean).length;
   const totalRated = () => DOMAINS.reduce((sum, d) => sum + rated(d.key), 0);
 
+  // BULK IMPORT — shared by Letterboxd, Goodreads, and Steam.
+  // Skips anything already rated locally so a second import never clobbers
+  // ratings made by hand or via search.
+  async function importRows(category, items) {
+    setImportStatus({ loading: true });
+    try {
+      const existingTitles = new Set(Object.keys(ratings[category]).map(t => t.toLowerCase()));
+      const fresh = items.filter(i => i.title && i.rating >= 1 && !existingTitles.has(i.title.toLowerCase()));
+      const rows = fresh.map(i => ({ user_id: userId, category, item_name: i.title, rating: i.rating }));
+      const chunkSize = 300;
+      for (let idx = 0; idx < rows.length; idx += chunkSize) {
+        const chunk = rows.slice(idx, idx + chunkSize);
+        if (chunk.length) {
+          const { error } = await supabase.from('tastes').insert(chunk);
+          if (error) throw error;
+        }
+      }
+      setRatings(prev => {
+        const next = { ...prev, [category]: { ...prev[category] } };
+        fresh.forEach(i => { next[category][i.title] = i.rating; });
+        return next;
+      });
+      const sourceLabel = category === 'film' ? 'letterboxd' : category === 'books' ? 'goodreads' : 'steam';
+      logEvent(userId, 'import_completed', `${sourceLabel}:${fresh.length}`);
+      setImportStatus({ loading: false, done: true, imported: fresh.length, skipped: items.length - fresh.length });
+    } catch (e) {
+      setImportStatus({ loading: false, error: 'Import failed. Check your connection and try again.' });
+    }
+  }
+
+  function handleFileUpload(e, source) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setImportStatus(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target.result;
+      const items = source === 'letterboxd' ? parseLetterboxdCSV(text) : parseGoodreadsCSV(text);
+      const category = source === 'letterboxd' ? 'film' : 'books';
+      setImportPreview({ source, category, items });
+    };
+    reader.readAsText(file);
+  }
+
+  async function fetchSteamLibrary() {
+    setSteamLoading(true); setSteamError(null); setSteamGames(null);
+    try {
+      const res = await fetch(`/api/steam-library?steamid=${encodeURIComponent(steamInput.trim())}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not load your Steam library.');
+      setSteamGames(data.games);
+    } catch (e) {
+      setSteamError(e.message || 'Could not load your Steam library. Make sure your profile and game list are set to public.');
+    }
+    setSteamLoading(false);
+  }
+
   // REAL TWIN MATCHING
   async function fetchRealTwins() {
     setTwinsLoading(true); setTwinsError(null);
@@ -174,6 +378,7 @@ export default function KindredApp() {
       const { data: all, error } = await supabase.from('tastes').select('user_id, category, item_name, rating');
       if (error) throw error;
       const mine = all.filter(t => t.user_id === userId);
+      const rarityWeights = computeRarityWeights(all);
       const byUser = {};
       all.forEach(t => {
         if (t.user_id === userId) return;
@@ -183,30 +388,38 @@ export default function KindredApp() {
       const candidates = [];
       for (const otherId in byUser) {
         const theirs = byUser[otherId];
-        const domainSims = {film:[],games:[],books:[]};
+        const weightedSims = []; // {sim, weight, category}
         mine.forEach(m => {
           const match = theirs.find(t => t.category === m.category && t.item_name === m.item_name);
           if (match) {
             const sim = 1 - Math.abs(m.rating - match.rating) / 4;
-            domainSims[m.category]?.push(sim);
+            const weight = rarityWeights[`${m.category}:${m.item_name}`] || 1;
+            weightedSims.push({ sim, weight, category: m.category });
           }
         });
-        const allSims = Object.values(domainSims).flat();
-        if (allSims.length === 0) continue;
-        const overall = Math.round((allSims.reduce((a,b)=>a+b,0)/allSims.length)*100);
+        if (weightedSims.length === 0) continue;
+        const totalWeight = weightedSims.reduce((a,b)=>a+b.weight,0);
+        const overall = Math.round((weightedSims.reduce((a,b)=>a+b.sim*b.weight,0)/totalWeight)*100);
         const domains = {};
-        Object.keys(domainSims).forEach(d => {
-          const arr = domainSims[d];
-          domains[d] = arr.length ? Math.round((arr.reduce((a,b)=>a+b,0)/arr.length)*100) : null;
+        ['film','games','books'].forEach(d => {
+          const arr = weightedSims.filter(w=>w.category===d);
+          if (!arr.length) { domains[d] = null; return; }
+          const tw = arr.reduce((a,b)=>a+b.weight,0);
+          domains[d] = Math.round((arr.reduce((a,b)=>a+b.sim*b.weight,0)/tw)*100);
         });
         const mineMap = {}; mine.forEach(t => { mineMap[`${t.category}:${t.item_name}`] = t.rating; });
         const theirMap = {}; theirs.forEach(t => { theirMap[`${t.category}:${t.item_name}`] = t.rating; });
         const shared = mine.filter(t => theirMap[`${t.category}:${t.item_name}`] !== undefined && t.rating >= 4 && theirMap[`${t.category}:${t.item_name}`] >= 4)
-          .map(t => ({title: t.item_name, mine: t.rating, theirs: theirMap[`${t.category}:${t.item_name}`]}))
-          .sort((a,b)=>(b.mine+b.theirs)-(a.mine+a.theirs)).slice(0,4);
+          .map(t => {
+            const key = `${t.category}:${t.item_name}`;
+            return { title: t.item_name, mine: t.rating, theirs: theirMap[key], weight: rarityWeights[key] || 1 };
+          })
+          .sort((a,b)=>b.weight-a.weight).slice(0,4);
         const onlyMine = mine.filter(t => !theirMap[`${t.category}:${t.item_name}`] && t.rating >= 4).slice(0,3);
         const onlyTheirs = theirs.filter(t => !mineMap[`${t.category}:${t.item_name}`] && t.rating >= 4).slice(0,3);
-        candidates.push({ id: otherId, overall, domains, overlap: allSims.length, shared, onlyMine, onlyTheirs });
+        const candidate = { id: otherId, overall, domains, overlap: weightedSims.length, shared, onlyMine, onlyTheirs };
+        candidate.why = buildWhyText(candidate);
+        candidates.push(candidate);
       }
       candidates.sort((a,b)=>b.overall-a.overall);
       const top = candidates.slice(0,5);
@@ -217,6 +430,7 @@ export default function KindredApp() {
         top.forEach(c => { c.handle = nameMap[c.id] ? `@${nameMap[c.id]}` : `@user`; });
       }
       setRealTwins(top);
+      if (top.length > 0) logEventOnce(userId, 'first_match_unlocked', `${top[0].overall}%`);
     } catch (e) {
       setTwinsError('Could not load taste twins. Check your connection and try again.');
     }
@@ -224,15 +438,32 @@ export default function KindredApp() {
   }
 
   useEffect(() => {
-    if (step === 'twins' && realTwins === null && !twinsLoading) fetchRealTwins();
+    if (step === 'twins' && realTwins === null && !twinsLoading && totalRated() >= TWIN_UNLOCK_THRESHOLD) fetchRealTwins();
   }, [step]);
+
+  async function sharePassport(level, archetype, total) {
+    const lines = [
+      'My Kindred Taste Passport',
+      `${archetype}`,
+      `Level: ${level}`,
+      `${total} items rated across film, games, and books`,
+      '',
+      'Find your own taste twin at kindredmatch.co',
+    ];
+    const text = lines.join('\n');
+    logEvent(userId, 'taste_passport_shared', archetype);
+    if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Passport' }); return; } catch (e) {} }
+    try { await navigator.clipboard.writeText(text); setCopiedId('passport'); setTimeout(()=>setCopiedId(null), 2000); } catch (e) {}
+  }
 
   // SHARE
   async function shareTwin(twin) {
     const lines = [`Kindred Taste Twin Match: ${twin.overall}%`, `Matched with ${twin.handle}`];
+    if (twin.why) lines.push(twin.why);
     if (twin.shared?.length) { lines.push('', 'We both loved:'); twin.shared.forEach(s => lines.push(`- ${s.title}`)); }
     lines.push('', 'Find your taste twin at kindredmatch.co');
     const text = lines.join('\n');
+    logEvent(userId, 'twin_card_shared', `${twin.overall}%`);
     if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Twin' }); return; } catch (e) {} }
     try { await navigator.clipboard.writeText(text); setCopiedId(twin.id); setTimeout(()=>setCopiedId(null), 2000); } catch (e) {}
   }
@@ -333,6 +564,11 @@ Return ONLY a JSON object, no markdown, no backticks:
             onKeyDown={e=>e.key==='Enter'&&handleAuth()} />
           <input className="k-input" style={s.input} type="text" placeholder="Display name (optional)"
             value={username} onChange={e=>setUsername(e.target.value)} />
+          <label style={{display:'flex',alignItems:'flex-start',gap:'0.6rem',marginBottom:'1rem',cursor:'pointer',textAlign:'left'}}>
+            <input type="checkbox" checked={subscribeEmail} onChange={e=>setSubscribeEmail(e.target.checked)}
+              style={{marginTop:'0.15rem',width:14,height:14,accentColor:G.purple,flexShrink:0}} />
+            <span style={{fontSize:'0.78rem',color:G.muted,lineHeight:1.5}}>Send me a weekly taste recap by email. Unsubscribe anytime.</span>
+          </label>
           {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
           <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
             onClick={handleAuth} disabled={authLoading}>
@@ -374,6 +610,10 @@ Return ONLY a JSON object, no markdown, no backticks:
               );
             })}
           </div>
+
+          <button onClick={()=>setStep('import')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.74rem',cursor:'pointer',fontFamily:'inherit',marginBottom:'1.25rem',padding:0,textDecoration:'underline'}}>
+            📥 Already rate things elsewhere? Import from Letterboxd, Goodreads, or Steam
+          </button>
 
           <CompletionWidget ratings={ratings} />
 
@@ -485,6 +725,213 @@ Return ONLY a JSON object, no markdown, no backticks:
     );
   }
 
+  // ─── IMPORT ────────────────────────────────────────────────
+  if (step === 'import') {
+    const sources = [
+      { key:'letterboxd', label:'Letterboxd', icon:'🎬' },
+      { key:'goodreads',  label:'Goodreads',  icon:'📚' },
+      { key:'steam',      label:'Steam',      icon:'🎮' },
+    ];
+
+    return (
+      <div style={s.app}>
+        <style>{FONTS+css}</style>
+        <div style={{maxWidth:620,margin:'0 auto',padding:'2rem 1.5rem'}} className="slide-in">
+          <button onClick={()=>setStep('quiz')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',marginBottom:'1.5rem',padding:0}}>← Back to rating</button>
+
+          <div style={{marginBottom:'1.5rem'}}>
+            <div style={{...s.eyebrow,color:G.purple}}>BULK IMPORT</div>
+            <h2 style={s.h2}>Bring in your existing ratings</h2>
+            <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>Already rated things on another platform? Import them here instead of starting from zero.</p>
+          </div>
+
+          <div style={{display:'flex',gap:'0.5rem',marginBottom:'1.5rem'}}>
+            {sources.map(src => {
+              const active = importTab === src.key;
+              return (
+                <button key={src.key} className="k-tab" onClick={()=>{setImportTab(src.key);setImportPreview(null);setImportStatus(null);}} style={{
+                  flex:1,padding:'0.6rem 0.5rem',borderRadius:10,border:`1px solid ${active?G.purple:G.border}`,
+                  background:active?G.purpleDim:G.card,color:active?G.purple:G.muted,
+                  cursor:'pointer',fontFamily:'inherit',fontSize:'0.78rem',fontWeight:active?600:400,transition:'all 0.2s'
+                }}>
+                  {src.icon} {src.label}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* LETTERBOXD */}
+          {importTab === 'letterboxd' && (
+            <>
+              <div style={{...s.card,marginBottom:'1.25rem'}}>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.75rem'}}>How to export from Letterboxd</div>
+                <ol style={{color:G.muted,fontSize:'0.82rem',lineHeight:1.8,paddingLeft:'1.2rem',margin:0}}>
+                  <li>On Letterboxd, hover your username (top right) → <strong style={{color:G.text}}>Settings</strong></li>
+                  <li>Click the <strong style={{color:G.text}}>Data</strong> tab</li>
+                  <li>Click <strong style={{color:G.text}}>Export Your Data</strong> — a ZIP file downloads</li>
+                  <li>Unzip it, then upload <strong style={{color:G.text}}>ratings.csv</strong> (or <strong style={{color:G.text}}>diary.csv</strong> if you don't have ratings.csv) below</li>
+                </ol>
+              </div>
+              {!importPreview && (
+                <label style={{display:'block',...s.card,textAlign:'center',cursor:'pointer',borderStyle:'dashed',marginBottom:'1rem'}}>
+                  <input type="file" accept=".csv" onChange={e=>handleFileUpload(e,'letterboxd')} style={{display:'none'}} />
+                  <div style={{fontSize:'1.5rem',marginBottom:'0.5rem'}}>📂</div>
+                  <div style={{fontSize:'0.85rem',color:G.muted}}>Tap to choose your ratings.csv or diary.csv</div>
+                </label>
+              )}
+            </>
+          )}
+
+          {/* GOODREADS */}
+          {importTab === 'goodreads' && (
+            <>
+              <div style={{...s.card,marginBottom:'1.25rem'}}>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.75rem'}}>How to export from Goodreads</div>
+                <ol style={{color:G.muted,fontSize:'0.82rem',lineHeight:1.8,paddingLeft:'1.2rem',margin:0}}>
+                  <li>On Goodreads (desktop site), click <strong style={{color:G.text}}>My Books</strong></li>
+                  <li>In the left sidebar under Tools, click <strong style={{color:G.text}}>Import and export</strong></li>
+                  <li>Click <strong style={{color:G.text}}>Export Library</strong> and wait for it to generate</li>
+                  <li>Download the CSV and upload it below</li>
+                </ol>
+              </div>
+              {!importPreview && (
+                <label style={{display:'block',...s.card,textAlign:'center',cursor:'pointer',borderStyle:'dashed',marginBottom:'1rem'}}>
+                  <input type="file" accept=".csv" onChange={e=>handleFileUpload(e,'goodreads')} style={{display:'none'}} />
+                  <div style={{fontSize:'1.5rem',marginBottom:'0.5rem'}}>📂</div>
+                  <div style={{fontSize:'0.85rem',color:G.muted}}>Tap to choose your Goodreads export CSV</div>
+                </label>
+              )}
+            </>
+          )}
+
+          {/* SHARED PREVIEW + CONFIRM (Letterboxd & Goodreads) */}
+          {(importTab==='letterboxd' || importTab==='goodreads') && importPreview && !importStatus?.done && (
+            <div style={{...s.card,marginBottom:'1.25rem'}}>
+              <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Found {importPreview.items.length} rated {importPreview.category==='film'?'movies/shows':'books'}</div>
+              <div style={{display:'flex',flexDirection:'column',gap:'0.3rem',marginBottom:'1rem'}}>
+                {importPreview.items.slice(0,5).map((it,i)=>(
+                  <div key={i} style={{fontSize:'0.78rem',color:G.muted,display:'flex',justifyContent:'space-between'}}>
+                    <span>{it.title}</span><span style={{color:G.purple,fontFamily:'Space Mono,monospace'}}>{'★'.repeat(it.rating)}</span>
+                  </div>
+                ))}
+                {importPreview.items.length>5 && <div style={{fontSize:'0.75rem',color:G.dim}}>+ {importPreview.items.length-5} more</div>}
+              </div>
+              {importStatus?.error && <div style={{color:'#FCA5A5',fontSize:'0.8rem',marginBottom:'0.75rem'}}>{importStatus.error}</div>}
+              <div style={{display:'flex',gap:'0.75rem'}}>
+                <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setImportPreview(null)}>Cancel</button>
+                <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:importStatus?.loading?0.6:1}}
+                  onClick={()=>importRows(importPreview.category, importPreview.items)} disabled={importStatus?.loading}>
+                  {importStatus?.loading ? 'Importing...' : `Import All ${importPreview.items.length} →`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* STEAM */}
+          {importTab === 'steam' && (
+            <>
+              <div style={{...s.card,marginBottom:'1.25rem'}}>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.75rem'}}>Before you start</div>
+                <p style={{color:G.muted,fontSize:'0.82rem',lineHeight:1.7,margin:0}}>
+                  Steam has no star ratings — only playtime. Your Steam profile and game list also need to be set to <strong style={{color:G.text}}>Public</strong> (Steam → Settings → Privacy Settings), or we won't be able to see your library at all.
+                </p>
+              </div>
+              {!steamGames && (
+                <div style={{...s.card,marginBottom:'1.25rem'}}>
+                  <input className="k-input" style={{...s.input,marginBottom:'0.75rem'}} placeholder="Your Steam profile URL or SteamID64"
+                    value={steamInput} onChange={e=>setSteamInput(e.target.value)} />
+                  {steamError && <div style={{color:'#FCA5A5',fontSize:'0.8rem',marginBottom:'0.75rem'}}>{steamError}</div>}
+                  <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:steamLoading?0.6:1}} onClick={fetchSteamLibrary} disabled={steamLoading || !steamInput.trim()}>
+                    {steamLoading ? 'Loading your library...' : 'Fetch My Library →'}
+                  </button>
+                </div>
+              )}
+
+              {steamGames && !importStatus?.done && (
+                <>
+                  <div style={{display:'flex',gap:'0.5rem',marginBottom:'1.25rem'}}>
+                    {[['auto','⚡ Auto-convert playtime'],['manual','✋ Pick stars myself']].map(([key,label])=>(
+                      <button key={key} className="k-tab" onClick={()=>setSteamMode(key)} style={{
+                        flex:1,padding:'0.55rem 0.5rem',borderRadius:10,border:`1px solid ${steamMode===key?G.cyan:G.border}`,
+                        background:steamMode===key?'rgba(6,182,212,0.1)':G.card,color:steamMode===key?G.cyan:G.muted,
+                        cursor:'pointer',fontFamily:'inherit',fontSize:'0.74rem',fontWeight:steamMode===key?600:400,transition:'all 0.2s'
+                      }}>{label}</button>
+                    ))}
+                  </div>
+
+                  {steamMode === 'auto' && (() => {
+                    const converted = steamGames.map(g=>({title:g.title, rating:playtimeToStars(g.minutes), hours:(g.minutes/60)}))
+                      .filter(g=>g.rating>0).sort((a,b)=>b.rating-a.rating);
+                    return (
+                      <div style={{...s.card,marginBottom:'1.25rem'}}>
+                        <p style={{color:G.muted,fontSize:'0.78rem',lineHeight:1.6,marginBottom:'1rem'}}>Rough estimate based on hours played. {steamGames.length-converted.length} games skipped (too little playtime for a real signal).</p>
+                        <div style={{display:'flex',flexDirection:'column',gap:'0.3rem',marginBottom:'1rem',maxHeight:280,overflowY:'auto'}}>
+                          {converted.slice(0,30).map((g,i)=>(
+                            <div key={i} style={{fontSize:'0.78rem',color:G.muted,display:'flex',justifyContent:'space-between',gap:'0.5rem'}}>
+                              <span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{g.title}</span>
+                              <span style={{color:G.cyan,fontFamily:'Space Mono,monospace',flexShrink:0}}>{'★'.repeat(g.rating)} · {g.hours.toFixed(0)}h</span>
+                            </div>
+                          ))}
+                          {converted.length>30 && <div style={{fontSize:'0.75rem',color:G.dim}}>+ {converted.length-30} more</div>}
+                        </div>
+                        {importStatus?.error && <div style={{color:'#FCA5A5',fontSize:'0.8rem',marginBottom:'0.75rem'}}>{importStatus.error}</div>}
+                        <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:importStatus?.loading?0.6:1}}
+                          onClick={()=>importRows('games', converted)} disabled={importStatus?.loading}>
+                          {importStatus?.loading ? 'Importing...' : `Import All ${converted.length} →`}
+                        </button>
+                      </div>
+                    );
+                  })()}
+
+                  {steamMode === 'manual' && (
+                    <div style={{...s.card,marginBottom:'1.25rem'}}>
+                      <p style={{color:G.muted,fontSize:'0.78rem',lineHeight:1.6,marginBottom:'1rem'}}>Click stars for whatever you want to rate. Skip the rest.</p>
+                      <div style={{display:'flex',flexDirection:'column',gap:'0.4rem',marginBottom:'1rem',maxHeight:320,overflowY:'auto'}}>
+                        {steamGames.slice(0,80).map((g,i)=>{
+                          const current = steamManualRatings[g.title] || 0;
+                          return (
+                            <div key={i} style={{display:'flex',alignItems:'center',gap:'0.5rem',padding:'0.4rem 0'}}>
+                              <span style={{flex:1,fontSize:'0.78rem',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{g.title}</span>
+                              <div style={{display:'flex',gap:'0.1rem',flexShrink:0}}>
+                                {[1,2,3,4,5].map(star=>(
+                                  <button key={star} onClick={()=>setSteamManualRatings(prev=>({...prev,[g.title]: prev[g.title]===star?0:star}))}
+                                    style={{background:'none',border:'none',cursor:'pointer',fontSize:'0.9rem',padding:'0.05rem',color:star<=current?G.cyan:'rgba(255,255,255,0.2)'}}>★</button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {importStatus?.error && <div style={{color:'#FCA5A5',fontSize:'0.8rem',marginBottom:'0.75rem'}}>{importStatus.error}</div>}
+                      <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:importStatus?.loading?0.6:1}}
+                        onClick={()=>importRows('games', Object.entries(steamManualRatings).filter(([,v])=>v>0).map(([title,rating])=>({title,rating})))}
+                        disabled={importStatus?.loading || Object.values(steamManualRatings).every(v=>!v)}>
+                        {importStatus?.loading ? 'Saving...' : 'Save My Ratings →'}
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          {/* SUCCESS (all sources) */}
+          {importStatus?.done && (
+            <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
+              <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>✅</div>
+              <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Imported {importStatus.imported} rating{importStatus.imported===1?'':'s'}</div>
+              {importStatus.skipped>0 && <p style={{color:G.dim,fontSize:'0.78rem',marginBottom:'1rem'}}>{importStatus.skipped} skipped — already rated</p>}
+              <div style={{display:'flex',gap:'0.75rem'}}>
+                <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>{setImportPreview(null);setImportStatus(null);setSteamGames(null);setSteamInput('');setSteamManualRatings({});}}>Import More</button>
+                <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('profile')}>See My Passport →</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   // ─── PROCESSING ────────────────────────────────────────────
   if (step === 'processing') {
     const stages = ['Analyzing taste fingerprint...','Mapping cross-domain patterns...','Saving your profile...','Almost there...'];
@@ -504,7 +951,7 @@ Return ONLY a JSON object, no markdown, no backticks:
     );
   }
 
-  // ─── PROFILE ───────────────────────────────────────────────
+  // ─── PROFILE / TASTE PASSPORT ────────────────────────────────
   if (step === 'profile') {
     const total = totalRated();
     const avg = (d) => { const v=Object.values(ratings[d]).filter(Boolean); return v.length?v.reduce((a,b)=>a+b,0)/v.length:0; };
@@ -520,16 +967,41 @@ Return ONLY a JSON object, no markdown, no backticks:
     if (allTitles.some(t=>['hades','celeste','hollow knight','stardew','undertale','shovel knight'].some(k=>t.includes(k)))) tags.push('Indie Game Fan');
     if (tags.length === 0) tags.push('Eclectic Taste', 'Curious Explorer');
 
+    const level = getExplorerLevel(total);
+    const archetype = pickArchetype(username || email || 'kindred', tags[0]);
+    const fresh = getFreshness(total);
+
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:560,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
-          <div style={{textAlign:'center',marginBottom:'2rem'}}>
-            <div style={{...s.eyebrow,color:G.purple}}>TASTE FINGERPRINT</div>
-            <h2 style={s.h2}>Your taste profile</h2>
-            <p style={{color:G.muted,fontSize:'0.85rem'}}>{total} items rated and saved</p>
+
+          {/* PASSPORT CARD */}
+          <div style={{background:`linear-gradient(135deg, ${G.purpleDim}, rgba(6,182,212,0.06))`,border:`1px solid rgba(139,92,246,0.25)`,borderRadius:20,padding:'1.75rem 1.5rem',marginBottom:'1.25rem',position:'relative',overflow:'hidden'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'1rem'}}>
+              <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.purple,textTransform:'uppercase',letterSpacing:'0.12em'}}>Taste Passport</div>
+              <div style={{background:'rgba(139,92,246,0.18)',border:'1px solid rgba(139,92,246,0.3)',borderRadius:100,padding:'0.25rem 0.75rem',fontSize:'0.68rem',color:'#C4B5D9',fontFamily:'Space Mono,monospace'}}>{level}</div>
+            </div>
+            <h2 style={{...s.h2,marginBottom:'0.4rem',fontSize:'clamp(1.5rem,3.5vw,2.1rem)'}}>{archetype}</h2>
+            <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'1.25rem'}}>{total} items rated across film, games, and books</p>
+            <CompletionWidget ratings={ratings} />
+            <div style={{marginBottom:'1.25rem'}}>
+              <div style={{display:'flex',justifyContent:'space-between',fontSize:'0.7rem',color:G.muted,marginBottom:'0.4rem'}}>
+                <span>Profile Freshness</span>
+                <span style={{fontFamily:'Space Mono,monospace',color:fresh.pct===100?G.green:G.amber}}>{fresh.pct}%</span>
+              </div>
+              <div style={{height:4,background:'rgba(255,255,255,0.08)',borderRadius:2,overflow:'hidden',marginBottom:'0.5rem'}}>
+                <div style={{height:'100%',width:`${fresh.pct}%`,background:fresh.pct===100?G.green:G.amber,borderRadius:2,transition:'width 0.6s ease'}}/>
+              </div>
+              <p style={{color:G.dim,fontSize:'0.72rem',margin:0}}>
+                {fresh.remaining===0 ? 'Your profile is fresh!' : `Rate ${fresh.remaining} more thing${fresh.remaining===1?'':'s'} to refresh it.`}
+              </p>
+            </div>
+            <button onClick={()=>sharePassport(level,archetype,total)} style={{width:'100%',background:'transparent',border:`1px solid rgba(139,92,246,0.3)`,color:copiedId==='passport'?G.green:'#C4B5D9',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
+              {copiedId==='passport' ? '✓ Copied — paste it anywhere' : '🔗 Share My Taste Passport'}
+            </button>
           </div>
-          <CompletionWidget ratings={ratings} />
+
           <div style={{...s.card,marginBottom:'1rem'}}>
             <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'1.25rem'}}>Average Rating by Domain</div>
             {DOMAINS.map(d => {
@@ -557,7 +1029,9 @@ Return ONLY a JSON object, no markdown, no backticks:
           </div>
           <div style={{display:'flex',gap:'0.75rem'}}>
             <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setStep('quiz')}>Rate More</button>
-            <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('twins')}>Find My Taste Twins →</button>
+            <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('twins')}>
+              {total >= TWIN_UNLOCK_THRESHOLD ? 'Find My Taste Twins →' : `🔒 Unlock Twin (${TWIN_UNLOCK_THRESHOLD - total} more)`}
+            </button>
           </div>
         </div>
       </div>
@@ -566,6 +1040,31 @@ Return ONLY a JSON object, no markdown, no backticks:
 
   // ─── TWINS ─────────────────────────────────────────────────
   if (step === 'twins') {
+    const totalNow = totalRated();
+    if (totalNow < TWIN_UNLOCK_THRESHOLD) {
+      const remaining = TWIN_UNLOCK_THRESHOLD - totalNow;
+      return (
+        <div style={s.app}>
+          <style>{FONTS+css}</style>
+          <div style={s.center}>
+            <div style={{fontSize:'2.5rem',marginBottom:'1.25rem'}}>🔒</div>
+            <h2 style={s.h2}>Your first twin is close</h2>
+            <p style={{color:G.muted,fontSize:'0.9rem',lineHeight:1.7,maxWidth:380,margin:'0 auto 1.75rem'}}>
+              Rate {remaining} more thing{remaining===1?'':'s'} to unlock your first twin. We hold off until there's enough signal for a match that actually feels right.
+            </p>
+            <div style={{maxWidth:280,width:'100%',margin:'0 auto 1.75rem'}}>
+              <div style={{height:5,background:'rgba(255,255,255,0.06)',borderRadius:3,overflow:'hidden'}}>
+                <div style={{height:'100%',width:`${Math.round((totalNow/TWIN_UNLOCK_THRESHOLD)*100)}%`,background:G.cyan,borderRadius:3,transition:'width 0.6s ease'}}/>
+              </div>
+              <p style={{color:G.dim,fontSize:'0.72rem',marginTop:'0.5rem'}}>{totalNow} / {TWIN_UNLOCK_THRESHOLD} rated</p>
+            </div>
+            <div style={{maxWidth:280,width:'100%'}}>
+              <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('quiz')}>Rate More →</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
@@ -611,6 +1110,11 @@ Return ONLY a JSON object, no markdown, no backticks:
                       <div style={{fontSize:'0.65rem',color:G.dim}}>match</div>
                     </div>
                   </div>
+                  {twin.why && (
+                    <div style={{background:'rgba(139,92,246,0.06)',border:'1px solid rgba(139,92,246,0.15)',borderRadius:10,padding:'0.7rem 0.875rem',marginBottom:'1rem',fontSize:'0.78rem',color:'#C4B5D9',lineHeight:1.5}}>
+                      💡 {twin.why}
+                    </div>
+                  )}
                   <div style={{display:'flex',gap:'0.5rem',marginBottom:twin.shared?.length?'1rem':'0'}}>
                     {DOMAINS.map(d => twin.domains[d.key]!==null && (
                       <div key={d.key} style={{flex:1,background:'rgba(255,255,255,0.03)',borderRadius:8,padding:'0.5rem',textAlign:'center'}}>

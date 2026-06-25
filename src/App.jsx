@@ -37,25 +37,98 @@ function getExplorerLevel(totalRated) {
   return current.label;
 }
 
-// Archetype — a stable-per-person flavor adjective combined with their strongest
-// taste signal. Same person always gets the same adjective (seeded by their own
-// name/email), so it reads like an identity, not a random label that changes.
-const ARCHETYPE_ADJECTIVES = ['Reflective','Curious','Bold','Restless','Sharp-Eyed','Wandering','Discerning','Eclectic'];
-const ARCHETYPE_GENRES = {
-  'Sci-Fi Enthusiast': 'Sci-Fi',
-  'Narrative Gamer': 'Narrative',
-  'Avid Reader': 'Literary',
-  'Art House Fan': 'Art House',
-  'Indie Game Fan': 'Indie',
-  'Eclectic Taste': 'Genre-Blending',
-  'Curious Explorer': 'Genre-Blending',
+// ─── ARCHETYPE — 3-AXIS COMBINATORIAL SYSTEM ─────────────────
+// Mood + dominant category + behavior, each computed independently from real
+// rating data, so two very different users won't land on the same label.
+// Mood and category get their own separate color palettes (pink/rose family
+// vs purple/red/amber/cyan/green/blue/yellow) so the two can never visually
+// collide on the same card, by construction rather than by runtime checking.
+
+const MOOD_WORDS_SAFE = ['Chaotic','Feral','Unhinged','Niche']; // won't date
+const MOOD_WORDS_FUN = ['Unwell','Delulu','Touch-Grass-Resistant','Insufferable']; // spicier, may date faster
+const MOOD_COLORS = {
+  Chaotic:'#EC4899', Feral:'#E11D48', Unhinged:'#DB2777', Niche:'#F472B6',
+  Unwell:'#FB7185', Delulu:'#F0ABFC', 'Touch-Grass-Resistant':'#FDA4AF', Insufferable:'#FB7185',
 };
-function pickArchetype(seed, primaryTag) {
+
+const CATEGORY_COLORS = {
+  'Sci-Fi':'#8B5CF6', Horror:'#EF4444', 'Literary Fiction':'#F59E0B', 'Strategy Games':'#06B6D4',
+  'Prestige Drama':'#A78BFA', Fantasy:'#10B981', Indie:'#FBBF24', Action:'#3B82F6',
+};
+
+// Best-effort keyword match against real rated titles. With the catalog now
+// fully open (real search, not a fixed list), this won't catch everything —
+// that's expected. No match at all just means the mood axis reads as "Niche."
+const CATEGORY_KEYWORDS = {
+  'Sci-Fi': ['interstellar','blade runner','dune','arrival','ex machina','inception','2001','contact','martian','foundation'],
+  'Horror': ['ring','exorcist','hereditary','midsommar','conjuring','resident evil','silent hill','it follows'],
+  'Literary Fiction': ['ishiguro','atwood','never let me go','beloved','the road','life of pi'],
+  'Strategy Games': ['civilization','age of empires','xcom','crusader kings','total war','starcraft','frostpunk'],
+  'Prestige Drama': ['succession','the wire','breaking bad','mad men','the sopranos'],
+  'Fantasy': ['witcher','lord of the rings','name of the wind','game of thrones'],
+  'Indie': ['hollow knight','celeste','stardew','undertale','hades','disco elysium'],
+  'Action': ['dark souls','god of war','devil may cry','doom','red dead','elden ring'],
+};
+
+function hashPick(seed, list) {
   let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) % ARCHETYPE_ADJECTIVES.length;
-  const adjective = ARCHETYPE_ADJECTIVES[Math.abs(hash) % ARCHETYPE_ADJECTIVES.length];
-  const genre = ARCHETYPE_GENRES[primaryTag] || 'Genre-Blending';
-  return `${adjective} ${genre} Explorer`;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) % list.length;
+  return list[Math.abs(hash) % list.length];
+}
+
+function pickCategoryAxis(ratings) {
+  const allTitles = Object.keys({...ratings.film, ...ratings.games, ...ratings.books}).map(t => t.toLowerCase());
+  const scores = {};
+  Object.entries(CATEGORY_KEYWORDS).forEach(([cat, keywords]) => {
+    scores[cat] = allTitles.filter(t => keywords.some(k => t.includes(k))).length;
+  });
+  const best = Object.entries(scores).sort((a,b) => b[1] - a[1])[0];
+  if (best && best[1] > 0) return { category: best[0], matched: best[1] };
+  // No keyword matches — fall back to whichever domain they rate most
+  const counts = { film: Object.keys(ratings.film).length, games: Object.keys(ratings.games).length, books: Object.keys(ratings.books).length };
+  const domainFallback = { film: 'Prestige Drama', games: 'Action', books: 'Literary Fiction' };
+  const topDomain = Object.entries(counts).sort((a,b) => b[1] - a[1])[0][0];
+  return { category: domainFallback[topDomain], matched: 0 };
+}
+
+function pickBehaviorAxis(ratings) {
+  const counts = { film: Object.keys(ratings.film).length, games: Object.keys(ratings.games).length, books: Object.keys(ratings.books).length };
+  const total = counts.film + counts.games + counts.books;
+  const allVals = [...Object.values(ratings.film), ...Object.values(ratings.games), ...Object.values(ratings.books)].filter(Boolean);
+  const avg = allVals.length ? allVals.reduce((a,b) => a+b, 0) / allVals.length : 0;
+  const minCount = Math.min(counts.film, counts.games, counts.books);
+  const maxCount = Math.max(counts.film, counts.games, counts.books);
+
+  if (total >= 15 && minCount >= 3) return 'Collector';
+  if (maxCount >= 8 && total > 0 && (maxCount / total) >= 0.7) return 'Completionist';
+  if (total > 0 && total <= 8 && avg >= 4.3) return 'Connoisseur';
+  return 'Explorer';
+}
+
+function pickMoodAxis(seed, category, behavior, matchedKeywords, totalRated) {
+  if (totalRated > 0 && matchedKeywords === 0) return 'Niche'; // didn't match any common-title list — genuinely obscure taste
+  if (category === 'Horror' || category === 'Action') return hashPick(seed + category, ['Feral','Unhinged']);
+  if (behavior === 'Collector' || behavior === 'Explorer') return 'Chaotic';
+  return hashPick(seed, MOOD_WORDS_SAFE);
+}
+
+function buildArchetype(seed, ratings) {
+  const total = Object.keys(ratings.film).length + Object.keys(ratings.games).length + Object.keys(ratings.books).length;
+  const { category, matched } = pickCategoryAxis(ratings);
+  const behavior = pickBehaviorAxis(ratings);
+  const mood = pickMoodAxis(seed, category, behavior, matched, total);
+  return { mood, category, behavior, moodColor: MOOD_COLORS[mood] || G.pink, categoryColor: CATEGORY_COLORS[category] || G.purple };
+}
+
+// ─── AFFILIATE LINKS ──────────────────────────────────────────
+// Amazon covers every type today. Books are isolated in their own branch
+// here on purpose — once Bookshop.org approves the account, this becomes a
+// one-line swap to bookshop.org/a/[affiliate-id]/[isbn] using the existing
+// /api/search-books endpoint for the ISBN, instead of touching every call site.
+const AMAZON_TAG = 'kindredmatch-20';
+function buildAffiliateLink(type, title) {
+  // TODO once Bookshop approves: if (type === 'book') return bookshop link using ISBN lookup
+  return `https://www.amazon.com/s?k=${encodeURIComponent(title)}&tag=${AMAZON_TAG}`;
 }
 
 // Freshness — a lightweight, display-only placeholder for a future real decay
@@ -166,6 +239,9 @@ export default function KindredApp() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [subscribeEmail, setSubscribeEmail] = useState(true);
+  const [checkingSession, setCheckingSession] = useState(true);
+  const [linkSent, setLinkSent] = useState(false);
+  const [pendingAuthUser, setPendingAuthUser] = useState(null);
 
   const [ratings, setRatings] = useState({film:{},games:{},books:{}});
   const [quizDomain, setQuizDomain] = useState('film');
@@ -197,9 +273,51 @@ export default function KindredApp() {
 
   const debounceRef = useRef({});
 
+  // ─── REAL AUTH — Supabase magic link ──────────────────────────
+  // On mount: check for an existing session, and listen for changes (this is
+  // what catches it the moment someone clicks the magic link in their email).
+  // A session gives us a real auth UUID — we look up (or create) the matching
+  // row in `users` by that UUID to get the int8 id everything else uses.
   useEffect(() => {
-    const saved = window.localStorage.getItem('kindred_email');
-    if (saved) setEmail(saved);
+    let active = true;
+
+    async function getUserRowByAuthId(authId) {
+      const { data } = await supabase.from('users').select('*').eq('auth_id', authId).maybeSingle();
+      return data;
+    }
+
+    async function handleSession(session) {
+      if (!session) {
+        if (active) { setCheckingSession(false); setStep('welcome'); }
+        return;
+      }
+      const authUser = session.user;
+      const row = await getUserRowByAuthId(authUser.id);
+      if (!active) return;
+      if (row) {
+        setUserId(row.id);
+        setEmail(row.email || authUser.email);
+        setUsername(row.username || '');
+        const { data: saved } = await supabase.from('tastes').select('category, item_name, rating').eq('user_id', row.id);
+        if (saved && saved.length) {
+          const loaded = { film:{}, games:{}, books:{} };
+          saved.forEach(t => { if (loaded[t.category]) loaded[t.category][t.item_name] = t.rating; });
+          setRatings(loaded);
+        }
+        touchLastActive(row.id);
+        setStep('quiz');
+      } else {
+        // Verified, but no profile yet — this is a brand new account.
+        setPendingAuthUser({ id: authUser.id, email: authUser.email });
+        setEmail(authUser.email);
+        setStep('welcome_setup');
+      }
+      setCheckingSession(false);
+    }
+
+    supabase.auth.getSession().then(({ data }) => handleSession(data.session));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => handleSession(session));
+    return () => { active = false; listener.subscription.unsubscribe(); };
   }, []);
 
   // SEARCH — debounced, fires 400ms after user stops typing
@@ -229,7 +347,6 @@ export default function KindredApp() {
     setSearchLoading(prev => ({...prev, [domain]: false}));
   }
 
-  // AUTH
   // ─── LIGHTWEIGHT ANALYTICS ───────────────────────────────────
   // Plain rows in an `events` table — no dashboard, just data you can query.
   // Takes an explicit uid (not the userId state) so it's safe to call in the
@@ -251,41 +368,52 @@ export default function KindredApp() {
     try { await supabase.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', uid); } catch (e) {}
   }
 
-  async function handleAuth() {
+  async function requestMagicLink() {
     setAuthError(null);
     if (!email || !email.includes('@')) { setAuthError('Enter a valid email.'); return; }
     setAuthLoading(true);
     try {
-      const { data: existing, error: findErr } = await supabase
-        .from('users').select('id, username').eq('email', email).maybeSingle();
-      if (findErr) throw findErr;
-      let uid;
-      if (existing) {
-        uid = existing.id;
-      } else {
-        const { data: created, error: insErr } = await supabase
-          .from('users')
-          .insert({ email, username: username || email.split('@')[0], subscribe_weekly_email: subscribeEmail })
-          .select('id').single();
-        if (insErr) throw insErr;
-        uid = created.id;
-        logEvent(uid, 'signup_completed');
-      }
-      touchLastActive(uid);
-      const { data: saved } = await supabase
-        .from('tastes').select('category, item_name, rating').eq('user_id', uid);
-      if (saved && saved.length) {
-        const loaded = {film:{},games:{},books:{}};
-        saved.forEach(t => { if (loaded[t.category]) loaded[t.category][t.item_name] = t.rating; });
-        setRatings(loaded);
-      }
-      window.localStorage.setItem('kindred_email', email);
-      setUserId(uid);
-      setStep('quiz');
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: { emailRedirectTo: window.location.origin },
+      });
+      if (error) throw error;
+      setLinkSent(true);
     } catch (e) {
-      setAuthError('Could not sign in. Check your connection and try again.');
+      setAuthError('Could not send the link. Check your connection and try again.');
     }
     setAuthLoading(false);
+  }
+
+  async function completeNewAccountSetup() {
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      const { data: created, error } = await supabase.from('users').insert({
+        auth_id: pendingAuthUser.id,
+        email: pendingAuthUser.email,
+        username: username || pendingAuthUser.email.split('@')[0],
+        subscribe_weekly_email: subscribeEmail,
+      }).select().single();
+      if (error) throw error;
+      logEvent(created.id, 'signup_completed');
+      touchLastActive(created.id);
+      setUserId(created.id);
+      setStep('quiz');
+    } catch (e) {
+      setAuthError('Could not finish setting up your account. Try again.');
+    }
+    setAuthLoading(false);
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut();
+    setUserId(null);
+    setRatings({ film:{}, games:{}, books:{} });
+    setEmail('');
+    setUsername('');
+    setLinkSent(false);
+    setStep('welcome');
   }
 
   // RATING — title is used as item_name key
@@ -442,16 +570,17 @@ export default function KindredApp() {
   }, [step]);
 
   async function sharePassport(level, archetype, total) {
+    const archetypeLabel = `${archetype.mood} ${archetype.category} ${archetype.behavior}`;
     const lines = [
       'My Kindred Taste Passport',
-      `${archetype}`,
+      archetypeLabel,
       `Level: ${level}`,
       `${total} items rated across film, games, and books`,
       '',
       'Find your own taste twin at kindredmatch.co',
     ];
     const text = lines.join('\n');
-    logEvent(userId, 'taste_passport_shared', archetype);
+    logEvent(userId, 'taste_passport_shared', archetypeLabel);
     if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Passport' }); return; } catch (e) {} }
     try { await navigator.clipboard.writeText(text); setCopiedId('passport'); setTimeout(()=>setCopiedId(null), 2000); } catch (e) {}
   }
@@ -547,6 +676,17 @@ Return ONLY a JSON object, no markdown, no backticks:
   `;
 
   // ─── WELCOME ───────────────────────────────────────────────
+  // ─── CHECKING SESSION ─────────────────────────────────────────
+  if (checkingSession) return (
+    <div style={s.app}>
+      <style>{FONTS+css}</style>
+      <div style={s.center}>
+        <div style={{width:40,height:40,border:`2px solid ${G.border}`,borderTop:`2px solid ${G.purple}`,borderRadius:'50%',animation:'spin 1s linear infinite'}}/>
+      </div>
+    </div>
+  );
+
+  // ─── WELCOME / SIGN IN ─────────────────────────────────────────
   if (step === 'welcome') return (
     <div style={s.app}>
       <style>{FONTS+css}</style>
@@ -558,10 +698,44 @@ Return ONLY a JSON object, no markdown, no backticks:
         <p style={{color:G.muted,lineHeight:1.75,fontSize:'1rem',maxWidth:460,margin:'0 auto 2.25rem'}}>
           Someone who actually gets your taste in movies, shows, books, and games. Get recommendations from them — not an algorithm.
         </p>
+
+        {linkSent ? (
+          <div style={{maxWidth:340,width:'100%'}}>
+            <div style={{fontSize:'1.75rem',marginBottom:'1rem'}}>📬</div>
+            <p style={{color:G.text,fontSize:'0.95rem',marginBottom:'0.5rem',fontWeight:500}}>Check your email</p>
+            <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.6,marginBottom:'1.25rem'}}>We sent a sign-in link to <strong style={{color:G.text}}>{email}</strong>. Open it on this device to continue.</p>
+            <button onClick={()=>setLinkSent(false)} style={{background:'none',border:'none',color:G.dim,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',textDecoration:'underline'}}>Use a different email</button>
+          </div>
+        ) : (
+          <div style={{maxWidth:340,width:'100%'}}>
+            <input className="k-input" style={s.input} type="email" placeholder="your@email.com"
+              value={email} onChange={e=>setEmail(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&requestMagicLink()} />
+            {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
+            <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
+              onClick={requestMagicLink} disabled={authLoading}>
+              {authLoading ? 'Sending...' : 'Send me a sign-in link →'}
+            </button>
+          </div>
+        )}
+        <p style={{color:G.dim,fontSize:'0.76rem',marginTop:'1rem'}}>No password needed. We'll email you a one-click link.</p>
+      </div>
+    </div>
+  );
+
+  // ─── FIRST-TIME ACCOUNT SETUP ──────────────────────────────────
+  // Only ever shown once, right after someone's very first verified sign-in.
+  // Returning users skip this completely — Supabase remembers them.
+  if (step === 'welcome_setup') return (
+    <div style={s.app}>
+      <style>{FONTS+css}</style>
+      <div style={s.center}>
+        <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'2rem',fontWeight:500,marginBottom:'2rem',letterSpacing:'0.06em'}}>
+          Kind<span style={{color:G.purple}}>r</span>ed
+        </div>
+        <h2 style={s.h2}>You're verified — almost there</h2>
+        <p style={{color:G.muted,lineHeight:1.7,fontSize:'0.95rem',maxWidth:420,margin:'0 auto 2rem'}}>One last thing before we build your taste profile.</p>
         <div style={{maxWidth:340,width:'100%'}}>
-          <input className="k-input" style={s.input} type="email" placeholder="your@email.com"
-            value={email} onChange={e=>setEmail(e.target.value)}
-            onKeyDown={e=>e.key==='Enter'&&handleAuth()} />
           <input className="k-input" style={s.input} type="text" placeholder="Display name (optional)"
             value={username} onChange={e=>setUsername(e.target.value)} />
           <label style={{display:'flex',alignItems:'flex-start',gap:'0.6rem',marginBottom:'1rem',cursor:'pointer',textAlign:'left'}}>
@@ -571,11 +745,10 @@ Return ONLY a JSON object, no markdown, no backticks:
           </label>
           {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
           <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
-            onClick={handleAuth} disabled={authLoading}>
-            {authLoading ? 'Signing in...' : 'Continue →'}
+            onClick={completeNewAccountSetup} disabled={authLoading}>
+            {authLoading ? 'Setting up...' : 'Start rating →'}
           </button>
         </div>
-        <p style={{color:G.dim,fontSize:'0.76rem',marginTop:'1rem'}}>No password needed. We'll remember you by email.</p>
       </div>
     </div>
   );
@@ -968,7 +1141,7 @@ Return ONLY a JSON object, no markdown, no backticks:
     if (tags.length === 0) tags.push('Eclectic Taste', 'Curious Explorer');
 
     const level = getExplorerLevel(total);
-    const archetype = pickArchetype(username || email || 'kindred', tags[0]);
+    const archetype = buildArchetype(username || email || 'kindred', ratings);
     const fresh = getFreshness(total);
 
     return (
@@ -982,7 +1155,11 @@ Return ONLY a JSON object, no markdown, no backticks:
               <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.purple,textTransform:'uppercase',letterSpacing:'0.12em'}}>Taste Passport</div>
               <div style={{background:'rgba(139,92,246,0.18)',border:'1px solid rgba(139,92,246,0.3)',borderRadius:100,padding:'0.25rem 0.75rem',fontSize:'0.68rem',color:'#C4B5D9',fontFamily:'Space Mono,monospace'}}>{level}</div>
             </div>
-            <h2 style={{...s.h2,marginBottom:'0.4rem',fontSize:'clamp(1.5rem,3.5vw,2.1rem)'}}>{archetype}</h2>
+            <h2 style={{...s.h2,marginBottom:'0.4rem',fontSize:'clamp(1.5rem,3.5vw,2.1rem)'}}>
+              <span style={{color:archetype.moodColor}}>{archetype.mood}</span>{' '}
+              <span style={{color:archetype.categoryColor}}>{archetype.category}</span>{' '}
+              <span>{archetype.behavior}</span>
+            </h2>
             <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'1.25rem'}}>{total} items rated across film, games, and books</p>
             <CompletionWidget ratings={ratings} />
             <div style={{marginBottom:'1.25rem'}}>
@@ -1027,12 +1204,13 @@ Return ONLY a JSON object, no markdown, no backticks:
               {tags.map(t=>(<span key={t} style={{background:G.purpleDim,border:'1px solid rgba(139,92,246,0.2)',color:'#C4B5D9',padding:'0.35rem 0.875rem',borderRadius:100,fontSize:'0.76rem'}}>{t}</span>))}
             </div>
           </div>
-          <div style={{display:'flex',gap:'0.75rem'}}>
+          <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem'}}>
             <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setStep('quiz')}>Rate More</button>
             <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('twins')}>
               {total >= TWIN_UNLOCK_THRESHOLD ? 'Find My Taste Twins →' : `🔒 Unlock Twin (${TWIN_UNLOCK_THRESHOLD - total} more)`}
             </button>
           </div>
+          <button onClick={handleSignOut} style={{background:'none',border:'none',color:G.dim,fontSize:'0.74rem',cursor:'pointer',fontFamily:'inherit',width:'100%',textAlign:'center',padding:'0.5rem'}}>Sign out</button>
         </div>
       </div>
     );
@@ -1170,20 +1348,28 @@ Return ONLY a JSON object, no markdown, no backticks:
           )}
           {recs && (
             <>
+              <p style={{color:G.dim,fontSize:'0.7rem',lineHeight:1.5,marginBottom:'1rem'}}>Kindred earns a small commission on purchases through these links, at no extra cost to you.</p>
               <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
                 {recs.map((rec,i)=>{
                   const cfg=typeMap[rec.type]||typeMap.film;
                   return (
-                    <div key={i} className="k-rec" style={{...s.card,display:'flex',gap:'1rem',alignItems:'flex-start',transition:'all 0.2s',cursor:'default'}}>
-                      <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
-                      <div style={{flex:1,minWidth:0}}>
-                        <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.35rem',flexWrap:'wrap'}}>
-                          <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
-                          <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+                    <div key={i} className="k-rec" style={{...s.card,transition:'all 0.2s'}}>
+                      <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
+                        <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.35rem',flexWrap:'wrap'}}>
+                            <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
+                            <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+                          </div>
+                          <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
                         </div>
-                        <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
+                        <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purple,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
                       </div>
-                      <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purple,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
+                      <a href={buildAffiliateLink(rec.type, rec.title)} target="_blank" rel="noopener noreferrer sponsored"
+                        onClick={()=>logEvent(userId,'affiliate_link_clicked',`${rec.type}:${rec.title}`)}
+                        style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:'2.5rem',color:G.cyan,fontSize:'0.76rem',textDecoration:'none'}}>
+                        🛒 Find it on Amazon
+                      </a>
                     </div>
                   );
                 })}

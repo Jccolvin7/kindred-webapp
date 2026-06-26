@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
+import { createRoot } from "react-dom/client";
 import { supabase } from "./supabaseClient";
 import Papa from "papaparse";
+import html2canvas from "html2canvas";
 
 const G = {
   bg:'#080B16', deep:'#0D1120', card:'rgba(255,255,255,0.04)',
@@ -37,19 +39,12 @@ function getExplorerLevel(totalRated) {
   return current.label;
 }
 
-// ─── ARCHETYPE — 3-AXIS COMBINATORIAL SYSTEM ─────────────────
-// Mood + dominant category + behavior, each computed independently from real
-// rating data, so two very different users won't land on the same label.
-// Mood and category get their own separate color palettes (pink/rose family
-// vs purple/red/amber/cyan/green/blue/yellow) so the two can never visually
-// collide on the same card, by construction rather than by runtime checking.
-
-const MOOD_WORDS_SAFE = ['Chaotic','Feral','Unhinged','Niche']; // won't date
-const MOOD_WORDS_FUN = ['Unwell','Delulu','Touch-Grass-Resistant','Insufferable']; // spicier, may date faster
-const MOOD_COLORS = {
-  Chaotic:'#EC4899', Feral:'#E11D48', Unhinged:'#DB2777', Niche:'#F472B6',
-  Unwell:'#FB7185', Delulu:'#F0ABFC', 'Touch-Grass-Resistant':'#FDA4AF', Insufferable:'#FB7185',
-};
+// ─── ARCHETYPE — 2-AXIS COMBINATORIAL SYSTEM ─────────────────
+// UPDATE: the original spec had a 3rd "mood/tone" axis (Chaotic, Feral,
+// etc). That's been dropped — it read as gimmicky/made-up. Now it's just
+// category + a real, human-sounding behavior word: 8 categories x 8
+// behavior words = 64 combinations, without sounding like a personality
+// quiz. Each axis still gets computed independently from real rating data.
 
 const CATEGORY_COLORS = {
   'Sci-Fi':'#8B5CF6', Horror:'#EF4444', 'Literary Fiction':'#F59E0B', 'Strategy Games':'#06B6D4',
@@ -58,7 +53,7 @@ const CATEGORY_COLORS = {
 
 // Best-effort keyword match against real rated titles. With the catalog now
 // fully open (real search, not a fixed list), this won't catch everything —
-// that's expected. No match at all just means the mood axis reads as "Niche."
+// that's expected; pickCategoryAxis falls back to domain spread when it does.
 const CATEGORY_KEYWORDS = {
   'Sci-Fi': ['interstellar','blade runner','dune','arrival','ex machina','inception','2001','contact','martian','foundation'],
   'Horror': ['ring','exorcist','hereditary','midsommar','conjuring','resident evil','silent hill','it follows'],
@@ -68,6 +63,17 @@ const CATEGORY_KEYWORDS = {
   'Fantasy': ['witcher','lord of the rings','name of the wind','game of thrones'],
   'Indie': ['hollow knight','celeste','stardew','undertale','hades','disco elysium'],
   'Action': ['dark souls','god of war','devil may cry','doom','red dead','elden ring'],
+};
+
+// AXIS 2 — behavior words, grouped into the four buckets the spec
+// describes. Two near-synonyms per bucket; a seed-hash picks between them
+// so two users landing in the same bucket don't necessarily get the
+// identical word, without making the choice unstable per-render.
+const BEHAVIOR_BUCKETS = {
+  fanatic:    ['Fanatic', 'Diehard'],     // very high count concentrated in the dominant category
+  connoisseur:['Connoisseur', 'Snob'],    // high count + consistently top ratings — quality-focused
+  aficionado: ['Aficionado', 'Lover'],    // broad engagement, solid count, decent average — the default enthusiast
+  nerd:       ['Junkie', 'Nerd'],         // thinner data / lower count — catch-all for newer profiles
 };
 
 function hashPick(seed, list) {
@@ -91,33 +97,36 @@ function pickCategoryAxis(ratings) {
   return { category: domainFallback[topDomain], matched: 0 };
 }
 
-function pickBehaviorAxis(ratings) {
-  const counts = { film: Object.keys(ratings.film).length, games: Object.keys(ratings.games).length, books: Object.keys(ratings.books).length };
-  const total = counts.film + counts.games + counts.books;
-  const allVals = [...Object.values(ratings.film), ...Object.values(ratings.games), ...Object.values(ratings.books)].filter(Boolean);
-  const avg = allVals.length ? allVals.reduce((a,b) => a+b, 0) / allVals.length : 0;
-  const minCount = Math.min(counts.film, counts.games, counts.books);
-  const maxCount = Math.max(counts.film, counts.games, counts.books);
+// Behavior is now driven by volume/pattern WITHIN the dominant category
+// specifically (not a global cross-domain comparison like the old version),
+// per the updated spec. Casual mapping is fine to start — this is more
+// about tone/flavor than a precise behavioral signal, refine later once
+// there's real usage data to look at.
+function pickBehaviorAxis(seed, category, ratings) {
+  const allTitles = { ...ratings.film, ...ratings.games, ...ratings.books };
+  const keywords = CATEGORY_KEYWORDS[category] || [];
+  // Titles that matched the dominant category's keyword list, with their rating.
+  const inCategory = Object.entries(allTitles)
+    .filter(([title]) => keywords.some(k => title.toLowerCase().includes(k)))
+    .map(([, rating]) => rating)
+    .filter(Boolean);
 
-  if (total >= 15 && minCount >= 3) return 'Collector';
-  if (maxCount >= 8 && total > 0 && (maxCount / total) >= 0.7) return 'Completionist';
-  if (total > 0 && total <= 8 && avg >= 4.3) return 'Connoisseur';
-  return 'Explorer';
-}
+  const count = inCategory.length;
+  const avg = count ? inCategory.reduce((a, b) => a + b, 0) / count : 0;
 
-function pickMoodAxis(seed, category, behavior, matchedKeywords, totalRated) {
-  if (totalRated > 0 && matchedKeywords === 0) return 'Niche'; // didn't match any common-title list — genuinely obscure taste
-  if (category === 'Horror' || category === 'Action') return hashPick(seed + category, ['Feral','Unhinged']);
-  if (behavior === 'Collector' || behavior === 'Explorer') return 'Chaotic';
-  return hashPick(seed, MOOD_WORDS_SAFE);
+  let bucket;
+  if (count >= 8) bucket = 'fanatic';                  // very high count concentrated here
+  else if (count >= 4 && avg >= 4.3) bucket = 'connoisseur'; // high count + consistently top ratings
+  else if (count >= 2) bucket = 'aficionado';           // broad engagement, solid count
+  else bucket = 'nerd';                                 // thin data — catch-all for newer profiles
+
+  return hashPick(seed + category, BEHAVIOR_BUCKETS[bucket]);
 }
 
 function buildArchetype(seed, ratings) {
-  const total = Object.keys(ratings.film).length + Object.keys(ratings.games).length + Object.keys(ratings.books).length;
-  const { category, matched } = pickCategoryAxis(ratings);
-  const behavior = pickBehaviorAxis(ratings);
-  const mood = pickMoodAxis(seed, category, behavior, matched, total);
-  return { mood, category, behavior, moodColor: MOOD_COLORS[mood] || G.pink, categoryColor: CATEGORY_COLORS[category] || G.purple };
+  const { category } = pickCategoryAxis(ratings);
+  const behavior = pickBehaviorAxis(seed, category, ratings);
+  return { category, behavior, categoryColor: CATEGORY_COLORS[category] || G.purple };
 }
 
 // ─── AFFILIATE LINKS ──────────────────────────────────────────
@@ -391,7 +400,7 @@ function buildGlobalTrendingRecs(myUserId, allTastes, excludeKeys, limit = RECS_
 async function saveArchetypeForUser(uid, ratingsState) {
   try {
     const archetype = buildArchetype(uid, ratingsState);
-    const label = `${archetype.mood} ${archetype.category} ${archetype.behavior}`;
+    const label = `${archetype.category} ${archetype.behavior}`;
     await supabase.from('users').update({ archetype: label }).eq('id', uid);
   } catch (e) { /* non-critical — Tier 3 just has one less data point this round */ }
 }
@@ -426,6 +435,128 @@ function playtimeToStars(minutes) {
   if (hours < 8) return 3;
   if (hours < 25) return 4;
   return 5;
+}
+
+// ─── SHAREABLE IMAGE CARDS ─────────────────────────────────────
+// Rendered off-screen at a fixed 1080x1080 (square — works cleanly on X,
+// Instagram, Discord, etc.) then captured to a PNG via html2canvas and
+// shared as a real image instead of plain text. Visually mirrors the on-
+// screen Taste Passport / Twin cards but strips anything meaningless to a
+// viewer who isn't the account owner (e.g. the freshness bar).
+
+function PassportShareCard({ archetype, level, total }) {
+  return (
+    <div style={{
+      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, #150B2E)`,
+      display:'flex', flexDirection:'column', justifyContent:'center', padding:'90px',
+      fontFamily:"'Inter',system-ui,sans-serif", color:G.text, boxSizing:'border-box', position:'relative',
+    }}>
+      <div style={{position:'absolute', top:70, left:90, fontFamily:"'Cormorant Garamond',serif", fontSize:38, fontWeight:500, letterSpacing:'0.04em'}}>
+        Kind<span style={{color:G.purple}}>r</span>ed
+      </div>
+      <div style={{position:'absolute', top:78, right:90, background:'rgba(139,92,246,0.18)', border:'1px solid rgba(139,92,246,0.35)', borderRadius:100, padding:'10px 28px', fontSize:22, color:'#C4B5D9', fontFamily:'Space Mono,monospace'}}>{level}</div>
+      <div style={{fontFamily:'Space Mono,monospace', fontSize:24, color:G.purple, textTransform:'uppercase', letterSpacing:'0.16em', marginBottom:28}}>Taste Passport</div>
+      <div style={{fontFamily:"'Cormorant Garamond',serif", fontWeight:300, fontSize:74, lineHeight:1.18, marginBottom:48}}>
+        <span style={{color:archetype.categoryColor}}>{archetype.category}</span>{' '}
+        <span>{archetype.behavior}</span>
+      </div>
+      <div style={{fontSize:30, color:G.muted, marginBottom:64}}>{total} items rated across film, games, and books</div>
+      <div style={{height:1, background:G.border, marginBottom:48}}/>
+      <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+        <div style={{fontSize:26, color:G.muted}}>Find your taste twin at</div>
+        <div style={{fontSize:30, color:G.cyan, fontFamily:'Space Mono,monospace'}}>kindredmatch.co</div>
+      </div>
+    </div>
+  );
+}
+
+function TwinShareCard({ twin }) {
+  return (
+    <div style={{
+      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, #150B2E)`,
+      display:'flex', flexDirection:'column', justifyContent:'center', padding:'90px',
+      fontFamily:"'Inter',system-ui,sans-serif", color:G.text, boxSizing:'border-box', position:'relative',
+    }}>
+      <div style={{position:'absolute', top:70, left:90, fontFamily:"'Cormorant Garamond',serif", fontSize:38, fontWeight:500, letterSpacing:'0.04em'}}>
+        Kind<span style={{color:G.purple}}>r</span>ed
+      </div>
+      <div style={{fontFamily:'Space Mono,monospace', fontSize:24, color:G.purple, textTransform:'uppercase', letterSpacing:'0.16em', marginBottom:28}}>Taste Twin Match</div>
+      <div style={{display:'flex', alignItems:'baseline', gap:24, marginBottom:40}}>
+        <div style={{fontFamily:'Space Mono,monospace', fontSize:160, color:G.purple, fontWeight:700, lineHeight:1}}>{twin.overall}%</div>
+        <div style={{fontSize:34, color:G.muted}}>match with {twin.handle}</div>
+      </div>
+      {twin.why && (
+        <div style={{background:'rgba(139,92,246,0.08)', border:'1px solid rgba(139,92,246,0.2)', borderRadius:18, padding:'32px 36px', marginBottom:48, fontSize:28, color:'#C4B5D9', lineHeight:1.5}}>
+          💡 {twin.why}
+        </div>
+      )}
+      {twin.shared?.length > 0 && (
+        <div style={{marginBottom:48}}>
+          <div style={{fontFamily:'Space Mono,monospace', fontSize:22, color:G.dim, textTransform:'uppercase', letterSpacing:'0.12em', marginBottom:20}}>You both loved</div>
+          <div style={{display:'flex', flexWrap:'wrap', gap:14}}>
+            {twin.shared.slice(0,4).map((s,i)=>(
+              <span key={i} style={{background:G.purpleDim, border:'1px solid rgba(139,92,246,0.25)', color:'#C4B5D9', padding:'12px 26px', borderRadius:100, fontSize:26}}>{s.title}</span>
+            ))}
+          </div>
+        </div>
+      )}
+      <div style={{height:1, background:G.border, marginBottom:48}}/>
+      <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+        <div style={{fontSize:26, color:G.muted}}>Find your taste twin at</div>
+        <div style={{fontSize:30, color:G.cyan, fontFamily:'Space Mono,monospace'}}>kindredmatch.co</div>
+      </div>
+    </div>
+  );
+}
+
+// Mounts a React element into a detached, off-screen DOM node (positioned
+// far outside the viewport rather than display:none, since html2canvas
+// needs real layout to read), waits a tick for it to paint, captures it to a
+// PNG, then unmounts and removes the node. Fully self-contained — doesn't
+// rely on the calling component's own JSX tree, which matters here since
+// the app's screens are a series of early `return`s per step rather than
+// one shared wrapper any hidden node could live inside.
+async function captureCardToBlob(element) {
+  const host = document.createElement('div');
+  host.style.position = 'fixed';
+  host.style.top = '-99999px';
+  host.style.left = '-99999px';
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  root.render(element);
+  // Give React + web fonts a moment to actually paint before snapshotting.
+  await new Promise(resolve => setTimeout(resolve, 150));
+  let blob = null;
+  try {
+    const canvas = await html2canvas(host.firstChild, { backgroundColor: null, scale: 1 });
+    blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  } finally {
+    root.unmount();
+    document.body.removeChild(host);
+  }
+  return blob;
+}
+
+// Tries the native share sheet with a real image attachment (mobile — what
+// actually fixes the "shared as plain text" problem), falling back to a
+// plain download if native share is unavailable or the user cancels it.
+async function shareOrDownloadBlob(blob, filename, shareTitle, shareText) {
+  if (!blob) return false;
+  const file = new File([blob], filename, { type: 'image/png' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: shareTitle, text: shareText });
+      return true;
+    } catch (e) {
+      // Cancelled or failed — fall through to download instead of nothing.
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return true;
 }
 
 function CompletionWidget({ ratings }) {
@@ -801,31 +932,29 @@ export default function KindredApp() {
   }, [step]);
 
   async function sharePassport(level, archetype, total) {
-    const archetypeLabel = `${archetype.mood} ${archetype.category} ${archetype.behavior}`;
-    const lines = [
-      'My Kindred Taste Passport',
-      archetypeLabel,
-      `Level: ${level}`,
-      `${total} items rated across film, games, and books`,
-      '',
-      'Find your own taste twin at kindredmatch.co',
-    ];
-    const text = lines.join('\n');
+    const archetypeLabel = `${archetype.category} ${archetype.behavior}`;
     logEvent(userId, 'taste_passport_shared', archetypeLabel);
-    if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Passport' }); return; } catch (e) {} }
-    try { await navigator.clipboard.writeText(text); setCopiedId('passport'); setTimeout(()=>setCopiedId(null), 2000); } catch (e) {}
+    try {
+      const blob = await captureCardToBlob(<PassportShareCard archetype={archetype} level={level} total={total} />);
+      const ok = await shareOrDownloadBlob(
+        blob, 'kindred-taste-passport.png', 'My Kindred Taste Passport',
+        `${archetypeLabel} — find your own taste twin at kindredmatch.co`,
+      );
+      if (ok) { setCopiedId('passport'); setTimeout(() => setCopiedId(null), 2500); }
+    } catch (e) { console.error('Share failed', e); }
   }
 
   // SHARE
   async function shareTwin(twin) {
-    const lines = [`Kindred Taste Twin Match: ${twin.overall}%`, `Matched with ${twin.handle}`];
-    if (twin.why) lines.push(twin.why);
-    if (twin.shared?.length) { lines.push('', 'We both loved:'); twin.shared.forEach(s => lines.push(`- ${s.title}`)); }
-    lines.push('', 'Find your taste twin at kindredmatch.co');
-    const text = lines.join('\n');
     logEvent(userId, 'twin_card_shared', `${twin.overall}%`);
-    if (navigator.share) { try { await navigator.share({ text, title: 'My Kindred Taste Twin' }); return; } catch (e) {} }
-    try { await navigator.clipboard.writeText(text); setCopiedId(twin.id); setTimeout(()=>setCopiedId(null), 2000); } catch (e) {}
+    try {
+      const blob = await captureCardToBlob(<TwinShareCard twin={twin} />);
+      const ok = await shareOrDownloadBlob(
+        blob, 'kindred-taste-twin.png', 'My Kindred Taste Twin Match',
+        `${twin.overall}% match with ${twin.handle} — find your own taste twin at kindredmatch.co`,
+      );
+      if (ok) { setCopiedId(twin.id); setTimeout(() => setCopiedId(null), 2500); }
+    } catch (e) { console.error('Share failed', e); }
   }
 
   // PROCESSING ANIMATION
@@ -1480,7 +1609,6 @@ Return ONLY a JSON object, no markdown, no backticks:
               <div style={{background:'rgba(139,92,246,0.18)',border:'1px solid rgba(139,92,246,0.3)',borderRadius:100,padding:'0.25rem 0.75rem',fontSize:'0.68rem',color:'#C4B5D9',fontFamily:'Space Mono,monospace'}}>{level}</div>
             </div>
             <h2 style={{...s.h2,marginBottom:'0.4rem',fontSize:'clamp(1.5rem,3.5vw,2.1rem)'}}>
-              <span style={{color:archetype.moodColor}}>{archetype.mood}</span>{' '}
               <span style={{color:archetype.categoryColor}}>{archetype.category}</span>{' '}
               <span>{archetype.behavior}</span>
             </h2>
@@ -1499,7 +1627,7 @@ Return ONLY a JSON object, no markdown, no backticks:
               </p>
             </div>
             <button onClick={()=>sharePassport(level,archetype,total)} style={{width:'100%',background:'transparent',border:`1px solid rgba(139,92,246,0.3)`,color:copiedId==='passport'?G.green:'#C4B5D9',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
-              {copiedId==='passport' ? '✓ Copied — paste it anywhere' : '🔗 Share My Taste Passport'}
+              {copiedId==='passport' ? '✓ Shared as image' : '🔗 Share My Taste Passport'}
             </button>
           </div>
 
@@ -1634,7 +1762,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                     </div>
                   )}
                   <button onClick={()=>shareTwin(twin)} style={{width:'100%',background:'transparent',border:`1px solid ${G.border}`,color:copiedId===twin.id?G.green:G.muted,padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
-                    {copiedId===twin.id ? '✓ Copied — paste it anywhere' : '🔗 Share this match'}
+                    {copiedId===twin.id ? '✓ Shared as image' : '🔗 Share this match'}
                   </button>
                 </div>
               ))}

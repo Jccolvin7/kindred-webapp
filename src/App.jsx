@@ -623,6 +623,12 @@ export default function KindredApp() {
   const [twinsLoading, setTwinsLoading] = useState(false);
   const [twinsError, setTwinsError] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
+  // Discord account-linking state — a short code the user types into the
+  // bot via /link, generated on demand and expiring after 10 minutes so a
+  // stale code can't be reused later by mistake.
+  const [linkCode, setLinkCode] = useState(null);
+  const [linkCodeLoading, setLinkCodeLoading] = useState(false);
+  const [discordLinked, setDiscordLinked] = useState(false);
 
   const [recs, setRecs] = useState(null);
   const [aiFallbackRecs, setAiFallbackRecs] = useState([]);
@@ -657,6 +663,7 @@ export default function KindredApp() {
         setUserId(row.id);
         setEmail(row.email || authUser.email);
         setUsername(row.username || '');
+        setDiscordLinked(!!row.discord_id);
         const { data: saved } = await supabase.from('tastes').select('category, item_name, rating').eq('user_id', row.id);
         if (saved && saved.length) {
           const loaded = { film:{}, games:{}, books:{} };
@@ -763,6 +770,29 @@ export default function KindredApp() {
       setAuthError('Could not finish setting up your account. Try again.');
     }
     setAuthLoading(false);
+  }
+
+  // Generates a short, human-typeable code and saves it to this user's row
+  // with a 10-minute expiry. The Discord bot looks this up when the user
+  // runs /link CODE, using its service-role key — RLS correctly wouldn't
+  // let a web session write to a different account's row anyway, so the
+  // actual merge has to happen bot-side. This function only ever writes to
+  // the signed-in user's OWN row, which the existing users_update_own
+  // policy already allows.
+  async function generateLinkCode() {
+    setLinkCodeLoading(true);
+    try {
+      const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const { error } = await supabase.from('users')
+        .update({ link_code: code, link_code_expires_at: expiresAt })
+        .eq('id', userId);
+      if (error) throw error;
+      setLinkCode(code);
+    } catch (e) {
+      setAuthError('Could not generate a link code. Try again.');
+    }
+    setLinkCodeLoading(false);
   }
 
   async function handleSignOut() {
@@ -1661,6 +1691,30 @@ Return ONLY a JSON object, no markdown, no backticks:
             <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('twins')}>
               {total >= TWIN_UNLOCK_THRESHOLD ? 'Find My Taste Twins →' : `🔒 Unlock Twin (${TWIN_UNLOCK_THRESHOLD - total} more)`}
             </button>
+          </div>
+          <div style={{...s.card,marginBottom:'1rem'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:discordLinked||linkCode?'0.75rem':'0'}}>
+              <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em'}}>Discord</div>
+              {discordLinked && <span style={{color:G.green,fontSize:'0.74rem'}}>✓ Connected</span>}
+            </div>
+            {discordLinked ? (
+              <p style={{color:G.muted,fontSize:'0.82rem',margin:0}}>Your ratings sync across web and Discord.</p>
+            ) : linkCode ? (
+              <>
+                <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'0.75rem'}}>In Discord, type this command:</p>
+                <div style={{background:G.purpleDim,border:'1px solid rgba(139,92,246,0.25)',borderRadius:10,padding:'0.75rem 1rem',fontFamily:'Space Mono,monospace',fontSize:'0.95rem',color:'#C4B5D9',textAlign:'center',marginBottom:'0.5rem'}}>
+                  /link {linkCode}
+                </div>
+                <p style={{color:G.dim,fontSize:'0.72rem',margin:0}}>Expires in 10 minutes. This combines your Discord ratings with this account.</p>
+              </>
+            ) : (
+              <>
+                <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'0.75rem'}}>Connect your Discord account so ratings and twins are shared across both.</p>
+                <button onClick={generateLinkCode} disabled={linkCodeLoading} style={{width:'100%',background:'transparent',border:`1px solid rgba(139,92,246,0.3)`,color:'#C4B5D9',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:linkCodeLoading?'default':'pointer',fontFamily:'inherit',opacity:linkCodeLoading?0.6:1,transition:'all 0.2s'}}>
+                  {linkCodeLoading ? 'Generating…' : 'Connect Discord'}
+                </button>
+              </>
+            )}
           </div>
           <button onClick={handleSignOut} style={{background:'none',border:'none',color:G.dim,fontSize:'0.74rem',cursor:'pointer',fontFamily:'inherit',width:'100%',textAlign:'center',padding:'0.5rem'}}>Sign out</button>
         </div>

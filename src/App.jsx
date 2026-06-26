@@ -144,16 +144,34 @@ async function buildAffiliateLink(type, title) {
 }
 
 // Looks up an ISBN for a book title via the existing search endpoint.
-// NOTE: assumes /api/search-books returns an `isbn` field per result (it's
-// backed by Open Library, which exposes ISBNs) — verify this matches your
-// actual endpoint response shape; if the field is named differently, fix it
-// here in this one place.
+// Backed by /api/search-books, which requests Open Library's `isbn` field
+// directly (fixed alongside this rebuild — it wasn't being requested before).
 async function lookupISBN(title) {
   try {
     const res = await fetch(`/api/search-books?q=${encodeURIComponent(title)}`);
     const data = await res.json();
     const match = data.results?.find(r => r.title?.toLowerCase() === title.toLowerCase()) || data.results?.[0];
     return match?.isbn || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Looks up a poster/cover image for a rec card by title, reusing the same
+// search endpoints the rating screen already uses (TMDB poster, RAWG
+// background_image, Open Library cover) — so rec cards show real cover art
+// instead of a generic emoji icon, matching what the rating screen shows.
+// Best-effort: a failed or missing lookup just falls back to the emoji icon
+// the card already renders, so this never blocks the recs screen.
+async function lookupPosterImage(type, title) {
+  try {
+    const endpoint = type === 'book' ? `/api/search-books?q=${encodeURIComponent(title)}`
+                    : type === 'game' ? `/api/search-games?q=${encodeURIComponent(title)}`
+                    : `/api/search-film?q=${encodeURIComponent(title)}`;
+    const res = await fetch(endpoint);
+    const data = await res.json();
+    const match = data.results?.find(r => r.title?.toLowerCase() === title.toLowerCase()) || data.results?.[0];
+    return match?.poster || null;
   } catch (e) {
     return null;
   }
@@ -876,7 +894,7 @@ export default function KindredApp() {
         aiPicks = await generateAIFallbackPicks();
       }
 
-      const finalRecs = combined.map((item) => {
+      const finalRecs = await Promise.all(combined.map(async (item) => {
         const type = item.category === 'film' ? 'film' : item.category === 'games' ? 'game' : 'book';
         let reason, matchScore, tierLabel;
         if (item.tier === 1) {
@@ -898,8 +916,11 @@ export default function KindredApp() {
           matchScore = Math.round(item.avgRating * 20);
           tierLabel = 'Kindred Trending';
         }
-        return { title: item.item_name, type, reason, matchScore, tier: item.tier, tierLabel };
-      });
+        // Best-effort poster lookup — same images shown on the rating screen.
+        // A miss just means the card falls back to its emoji icon.
+        const poster = await lookupPosterImage(type, item.item_name);
+        return { title: item.item_name, type, reason, matchScore, tier: item.tier, tierLabel, poster };
+      }));
 
       setRecs(finalRecs);
       setAiFallbackRecs(aiPicks);
@@ -935,7 +956,14 @@ Return ONLY a JSON object, no markdown, no backticks:
       const tb = data.content?.find(c => c.type === 'text');
       if (!tb) return [];
       const parsed = JSON.parse(tb.text.replace(/```json|```/g,'').trim());
-      return (parsed.recommendations || []).map(r => ({ ...r, tier: 5, tierLabel: 'Beyond Your Taste Network' }));
+      const picks = parsed.recommendations || [];
+      // Best-effort poster lookup, same as the real-data tiers above.
+      // 'show' uses the film/TV endpoint since search-film covers both.
+      return Promise.all(picks.map(async (r) => {
+        const lookupType = r.type === 'show' ? 'film' : r.type;
+        const poster = await lookupPosterImage(lookupType, r.title);
+        return { ...r, tier: 5, tierLabel: 'Beyond Your Taste Network', poster };
+      }));
     } catch (e) {
       return [];
     }
@@ -1664,7 +1692,11 @@ Return ONLY a JSON object, no markdown, no backticks:
                     return (
                       <div key={i} className="k-rec" style={{...s.card,transition:'all 0.2s'}}>
                         <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
-                          <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                          {rec.poster ? (
+                            <img src={rec.poster} alt="" style={{width:42,height:rec.type==='game'?28:60,objectFit:'cover',borderRadius:6,flexShrink:0,background:G.deep}}/>
+                          ) : (
+                            <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                          )}
                           <div style={{flex:1,minWidth:0}}>
                             <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.3rem',flexWrap:'wrap'}}>
                               <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
@@ -1703,7 +1735,11 @@ Return ONLY a JSON object, no markdown, no backticks:
                       return (
                         <div key={i} className="k-rec" style={{...s.card,border:`1px dashed ${G.border}`,transition:'all 0.2s'}}>
                           <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
-                            <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                            {rec.poster ? (
+                              <img src={rec.poster} alt="" style={{width:42,height:rec.type==='game'?28:60,objectFit:'cover',borderRadius:6,flexShrink:0,background:G.deep}}/>
+                            ) : (
+                              <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                            )}
                             <div style={{flex:1,minWidth:0}}>
                               <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.35rem',flexWrap:'wrap'}}>
                                 <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>

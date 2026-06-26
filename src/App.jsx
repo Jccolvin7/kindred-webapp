@@ -126,9 +126,37 @@ function buildArchetype(seed, ratings) {
 // one-line swap to bookshop.org/a/[affiliate-id]/[isbn] using the existing
 // /api/search-books endpoint for the ISBN, instead of touching every call site.
 const AMAZON_TAG = 'kindredmatch-20';
-function buildAffiliateLink(type, title) {
-  // TODO once Bookshop approves: if (type === 'book') return bookshop link using ISBN lookup
+// Bookshop is approved — books now get real ISBN-based affiliate links.
+// IMPORTANT: replace this with your real Bookshop affiliate ID from the
+// Bookshop dashboard before deploying.
+const BOOKSHOP_AFFILIATE_ID = '125337';
+
+// Books need a live ISBN lookup (we don't store ISBNs on ratings), so this
+// is now async. Film/games stay sync-fast via Amazon search links since
+// TMDB/RAWG don't expose ASINs anyway.
+async function buildAffiliateLink(type, title) {
+  if (type === 'book') {
+    const isbn = await lookupISBN(title);
+    if (isbn) return `https://bookshop.org/a/${BOOKSHOP_AFFILIATE_ID}/${isbn}`;
+    // No confident ISBN match — fall back to Amazon rather than a dead link.
+  }
   return `https://www.amazon.com/s?k=${encodeURIComponent(title)}&tag=${AMAZON_TAG}`;
+}
+
+// Looks up an ISBN for a book title via the existing search endpoint.
+// NOTE: assumes /api/search-books returns an `isbn` field per result (it's
+// backed by Open Library, which exposes ISBNs) — verify this matches your
+// actual endpoint response shape; if the field is named differently, fix it
+// here in this one place.
+async function lookupISBN(title) {
+  try {
+    const res = await fetch(`/api/search-books?q=${encodeURIComponent(title)}`);
+    const data = await res.json();
+    const match = data.results?.find(r => r.title?.toLowerCase() === title.toLowerCase()) || data.results?.[0];
+    return match?.isbn || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 // Freshness — a lightweight, display-only placeholder for a future real decay
@@ -167,6 +195,187 @@ function buildWhyText(twin) {
   if (top.length === 1) return `Matched mostly on ${top[0]} — not many people have rated that one.`;
   const last = top.pop();
   return `Matched mostly on ${top.join(', ')} and ${last} — rare picks that few others share.`;
+}
+
+// ─── 5-TIER RECOMMENDATION ENGINE ─────────────────────────────
+// Replaces the old approach (hand the user's ratings to Claude and ask it to
+// invent 6 titles). Tiers fill top-down — each tier only runs if the one
+// above didn't fill the screen, and there's no padding to force a round
+// number. AI is Tier 5 only: a labeled, visually distinct last resort, never
+// blended with the real-data tiers above it. This protects the actual moat
+// (real people whose taste matches yours) from quietly becoming AI guesses.
+
+const RECS_TARGET = 6; // soft target per screen — tiers stop once hit, not a hard requirement
+
+// Builds the same twin graph fetchRealTwins() builds, but returns the raw
+// scored candidate list (not the UI-shaped twin cards) so both the Twins
+// screen and the rec engine share one source of truth instead of two copies
+// of the same matching math drifting apart over time.
+function buildTwinGraph(myUserId, allTastes) {
+  const rarityWeights = computeRarityWeights(allTastes);
+  const mine = allTastes.filter(t => t.user_id === myUserId);
+  const byUser = {};
+  allTastes.forEach(t => {
+    if (t.user_id === myUserId) return;
+    if (!byUser[t.user_id]) byUser[t.user_id] = [];
+    byUser[t.user_id].push(t);
+  });
+
+  const candidates = [];
+  for (const otherId in byUser) {
+    const theirs = byUser[otherId];
+    const weightedSims = [];
+    mine.forEach(m => {
+      const match = theirs.find(t => t.category === m.category && t.item_name === m.item_name);
+      if (match) {
+        const sim = 1 - Math.abs(m.rating - match.rating) / 4;
+        const weight = rarityWeights[`${m.category}:${m.item_name}`] || 1;
+        weightedSims.push({ sim, weight });
+      }
+    });
+    if (weightedSims.length === 0) continue;
+    const totalWeight = weightedSims.reduce((a, b) => a + b.weight, 0);
+    const overall = Math.round((weightedSims.reduce((a, b) => a + b.sim * b.weight, 0) / totalWeight) * 100);
+    candidates.push({ id: otherId, overall, ratings: theirs });
+  }
+  candidates.sort((a, b) => b.overall - a.overall);
+  return { mine, rarityWeights, candidates };
+}
+
+// Tier 1 — items the user's top twins rated 4-5 stars that the user hasn't
+// rated. Ranked by twin match score + rarity weight + how many different
+// twins loved it. Highest-trust tier: real people, direct match.
+function buildTwinBackedRecs(myUserId, allTastes, limit = RECS_TARGET) {
+  const { mine, rarityWeights, candidates } = buildTwinGraph(myUserId, allTastes);
+  const mineKeys = new Set(mine.map(t => `${t.category}:${t.item_name}`));
+  const topTwins = candidates.slice(0, 10); // consider top 10 twins, not just the top 5 shown on the Twins screen
+
+  const itemMap = {};
+  topTwins.forEach(twin => {
+    twin.ratings.forEach(r => {
+      if (r.rating < 4) return;
+      const key = `${r.category}:${r.item_name}`;
+      if (mineKeys.has(key)) return;
+      if (!itemMap[key]) itemMap[key] = { category: r.category, item_name: r.item_name, twinScores: [] };
+      itemMap[key].twinScores.push({ twinScore: twin.overall, rarityWeight: rarityWeights[key] || 1 });
+    });
+  });
+
+  const scored = Object.values(itemMap).map(entry => {
+    const rarityWeight = entry.twinScores[0].rarityWeight;
+    const twinCount = entry.twinScores.length;
+    const avgTwinScore = entry.twinScores.reduce((a, b) => a + b.twinScore, 0) / twinCount;
+    // Composite rank: avg twin match score, boosted by rarity and by how many
+    // independent twins loved it (sqrt damping so one item loved by 6 twins
+    // doesn't totally dominate over a rarer 2-twin pick).
+    const rank = avgTwinScore * rarityWeight * Math.sqrt(twinCount);
+    return { ...entry, twinCount, avgTwinScore: Math.round(avgTwinScore), rank, tier: 1 };
+  });
+
+  scored.sort((a, b) => b.rank - a.rank);
+  return scored.slice(0, limit);
+}
+
+// Tier 2 — neighbor-of-neighbor. Walk one hop further: the user's twins' own
+// top twins. Surfaces items second-degree connections loved that neither the
+// user nor their direct twins have rated. Still zero AI.
+function buildNeighborOfNeighborRecs(myUserId, allTastes, excludeKeys, limit = RECS_TARGET) {
+  const { mine, rarityWeights, candidates } = buildTwinGraph(myUserId, allTastes);
+  const mineKeys = new Set(mine.map(t => `${t.category}:${t.item_name}`));
+  const directTwins = candidates.slice(0, 10);
+  const directTwinIds = new Set(directTwins.map(t => t.id));
+  const directTwinItemKeys = new Set();
+  directTwins.forEach(t => t.ratings.forEach(r => directTwinItemKeys.add(`${r.category}:${r.item_name}`)));
+
+  const secondDegree = {}; // userId -> { score, ratings }, deduped across direct twins
+  directTwins.forEach(twin => {
+    const { candidates: theirTwins } = buildTwinGraph(twin.id, allTastes);
+    theirTwins.slice(0, 5).forEach(t2 => {
+      if (t2.id === myUserId || directTwinIds.has(t2.id)) return;
+      if (!secondDegree[t2.id]) secondDegree[t2.id] = { score: t2.overall, ratings: t2.ratings };
+    });
+  });
+
+  const itemMap = {};
+  Object.values(secondDegree).forEach(({ score, ratings }) => {
+    ratings.forEach(r => {
+      if (r.rating < 4) return;
+      const key = `${r.category}:${r.item_name}`;
+      if (mineKeys.has(key) || directTwinItemKeys.has(key) || excludeKeys.has(key)) return;
+      if (!itemMap[key]) itemMap[key] = { category: r.category, item_name: r.item_name, scores: [] };
+      itemMap[key].scores.push(score);
+    });
+  });
+
+  const scored = Object.values(itemMap).map(entry => {
+    const count = entry.scores.length;
+    const avgScore = entry.scores.reduce((a, b) => a + b, 0) / count;
+    const rarityWeight = rarityWeights[`${entry.category}:${entry.item_name}`] || 1;
+    const rank = avgScore * rarityWeight * Math.sqrt(count);
+    return { ...entry, neighborCount: count, avgScore: Math.round(avgScore), rank, tier: 2 };
+  });
+
+  scored.sort((a, b) => b.rank - a.rank);
+  return scored.slice(0, limit);
+}
+
+// Tier 3 — archetype/community trending. Items popular among users who share
+// the current user's archetype. Requires users.archetype to be populated
+// (written on every rating/import change — see saveArchetypeForUser below).
+async function buildArchetypeTrendingRecs(myArchetype, myUserId, allTastes, excludeKeys, limit = RECS_TARGET) {
+  if (!myArchetype) return [];
+  const { data: sameArchetypeUsers, error } = await supabase
+    .from('users').select('id').eq('archetype', myArchetype);
+  if (error || !sameArchetypeUsers?.length) return [];
+
+  const peerIds = new Set(sameArchetypeUsers.map(u => u.id).filter(id => id !== myUserId));
+  if (peerIds.size === 0) return [];
+
+  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => `${t.category}:${t.item_name}`));
+  const itemMap = {};
+  allTastes.forEach(t => {
+    if (!peerIds.has(t.user_id) || t.rating < 4) return;
+    const key = `${t.category}:${t.item_name}`;
+    if (mineKeys.has(key) || excludeKeys.has(key)) return;
+    if (!itemMap[key]) itemMap[key] = { category: t.category, item_name: t.item_name, count: 0, ratingSum: 0 };
+    itemMap[key].count++;
+    itemMap[key].ratingSum += t.rating;
+  });
+
+  const scored = Object.values(itemMap).map(entry => ({ ...entry, avgRating: entry.ratingSum / entry.count, tier: 3 }));
+  scored.sort((a, b) => (b.count * b.avgRating) - (a.count * a.avgRating));
+  return scored.slice(0, limit);
+}
+
+// Tier 4 — global trending/hidden gems across the whole platform. The floor
+// for "real human data, no AI." For a very early/small user base this may
+// legitimately come back empty.
+function buildGlobalTrendingRecs(myUserId, allTastes, excludeKeys, limit = RECS_TARGET) {
+  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => `${t.category}:${t.item_name}`));
+  const itemMap = {};
+  allTastes.forEach(t => {
+    if (t.user_id === myUserId || t.rating < 4) return;
+    const key = `${t.category}:${t.item_name}`;
+    if (mineKeys.has(key) || excludeKeys.has(key)) return;
+    if (!itemMap[key]) itemMap[key] = { category: t.category, item_name: t.item_name, count: 0, ratingSum: 0 };
+    itemMap[key].count++;
+    itemMap[key].ratingSum += t.rating;
+  });
+  const scored = Object.values(itemMap).map(entry => ({ ...entry, avgRating: entry.ratingSum / entry.count, tier: 4 }));
+  scored.sort((a, b) => (b.count * b.avgRating) - (a.count * a.avgRating));
+  return scored.slice(0, limit);
+}
+
+// Writes the user's current archetype to users.archetype. Call this right
+// after a rating is saved and right after an import completes — the two
+// places ratings change. Fire-and-forget; a failed write here shouldn't
+// block the action the user is actually trying to do.
+async function saveArchetypeForUser(uid, ratingsState) {
+  try {
+    const archetype = buildArchetype(uid, ratingsState);
+    const label = `${archetype.mood} ${archetype.category} ${archetype.behavior}`;
+    await supabase.from('users').update({ archetype: label }).eq('id', uid);
+  } catch (e) { /* non-critical — Tier 3 just has one less data point this round */ }
 }
 
 // ─── IMPORT HELPERS ───────────────────────────────────────────
@@ -267,6 +476,7 @@ export default function KindredApp() {
   const [copiedId, setCopiedId] = useState(null);
 
   const [recs, setRecs] = useState(null);
+  const [aiFallbackRecs, setAiFallbackRecs] = useState([]);
   const [recError, setRecError] = useState(null);
   const [recLoading, setRecLoading] = useState(false);
   const [procStage, setProcStage] = useState(0);
@@ -419,7 +629,8 @@ export default function KindredApp() {
   // RATING — title is used as item_name key
   async function setRating(domain, title, val) {
     const newVal = ratings[domain][title] === val ? undefined : val;
-    setRatings(prev => ({...prev, [domain]: {...prev[domain], [title]: newVal}}));
+    const nextRatings = {...ratings, [domain]: {...ratings[domain], [title]: newVal}};
+    setRatings(nextRatings);
     if (!userId) return;
     if (newVal !== undefined) touchLastActive(userId);
     try {
@@ -436,6 +647,9 @@ export default function KindredApp() {
       } else {
         await supabase.from('tastes').insert({ user_id: userId, category: domain, item_name: title, rating: newVal });
       }
+      // Keep the archetype on file fresh so Tier 3 (archetype trending) has
+      // accurate data for this user going forward. Fire-and-forget.
+      saveArchetypeForUser(userId, nextRatings);
     } catch (e) { console.error('Save failed', e); }
   }
 
@@ -459,13 +673,12 @@ export default function KindredApp() {
           if (error) throw error;
         }
       }
-      setRatings(prev => {
-        const next = { ...prev, [category]: { ...prev[category] } };
-        fresh.forEach(i => { next[category][i.title] = i.rating; });
-        return next;
-      });
+      const nextRatings = { ...ratings, [category]: { ...ratings[category] } };
+      fresh.forEach(i => { nextRatings[category][i.title] = i.rating; });
+      setRatings(nextRatings);
       const sourceLabel = category === 'film' ? 'letterboxd' : category === 'books' ? 'goodreads' : 'steam';
       logEvent(userId, 'import_completed', `${sourceLabel}:${fresh.length}`);
+      saveArchetypeForUser(userId, nextRatings); // keep archetype fresh after a bulk import too
       setImportStatus({ loading: false, done: true, imported: fresh.length, skipped: items.length - fresh.length });
     } catch (e) {
       setImportStatus({ loading: false, error: 'Import failed. Check your connection and try again.' });
@@ -618,31 +831,114 @@ export default function KindredApp() {
   async function generateRecs() {
     setRecLoading(true); setRecError(null);
     try {
+      const { data: allTastes, error } = await supabase
+        .from('tastes').select('user_id, category, item_name, rating');
+      if (error) throw error;
+
+      const { data: myUserRow } = await supabase.from('users').select('archetype').eq('id', userId).single();
+      const myArchetype = myUserRow?.archetype || null;
+
+      const excludeKeys = new Set();
+      const addToExclude = (items) => items.forEach(i => excludeKeys.add(`${i.category}:${i.item_name}`));
+      let combined = [];
+
+      // Tier 1 — twin-backed
+      const tier1 = buildTwinBackedRecs(userId, allTastes, RECS_TARGET);
+      addToExclude(tier1);
+      combined = combined.concat(tier1);
+
+      // Tier 2 — neighbor-of-neighbor (only if Tier 1 didn't fill the screen)
+      if (combined.length < RECS_TARGET) {
+        const tier2 = buildNeighborOfNeighborRecs(userId, allTastes, excludeKeys, RECS_TARGET - combined.length);
+        addToExclude(tier2);
+        combined = combined.concat(tier2);
+      }
+
+      // Tier 3 — archetype trending
+      if (combined.length < RECS_TARGET) {
+        const tier3 = await buildArchetypeTrendingRecs(myArchetype, userId, allTastes, excludeKeys, RECS_TARGET - combined.length);
+        addToExclude(tier3);
+        combined = combined.concat(tier3);
+      }
+
+      // Tier 4 — global trending
+      if (combined.length < RECS_TARGET) {
+        const tier4 = buildGlobalTrendingRecs(userId, allTastes, excludeKeys, RECS_TARGET - combined.length);
+        addToExclude(tier4);
+        combined = combined.concat(tier4);
+      }
+
+      // Tier 5 — AI last resort, ONLY if tiers 1-4 produced nothing at all.
+      // Rendered in its own clearly-labeled bucket — never merged into the
+      // same list as the human-data tiers above, never worded similarly.
+      let aiPicks = [];
+      if (combined.length === 0) {
+        aiPicks = await generateAIFallbackPicks();
+      }
+
+      const finalRecs = combined.map((item) => {
+        const type = item.category === 'film' ? 'film' : item.category === 'games' ? 'game' : 'book';
+        let reason, matchScore, tierLabel;
+        if (item.tier === 1) {
+          reason = item.twinCount > 1
+            ? `${item.twinCount} of your Taste Neighbors rated this 4-5★`
+            : `Your top taste twin rated this a strong match for you`;
+          matchScore = item.avgTwinScore;
+          tierLabel = 'Twin-Backed';
+        } else if (item.tier === 2) {
+          reason = `${item.neighborCount} people in your extended taste network loved this`;
+          matchScore = item.avgScore;
+          tierLabel = 'Taste Network';
+        } else if (item.tier === 3) {
+          reason = `Popular among people who share your taste archetype (${item.count} loved it)`;
+          matchScore = Math.round(item.avgRating * 20); // 1-5 stars -> 20-100 scale, rough but consistent
+          tierLabel = 'Trending In Your Archetype';
+        } else {
+          reason = `Trending across all of Kindred — ${item.count} people rated it ${item.avgRating.toFixed(1)}★ on average`;
+          matchScore = Math.round(item.avgRating * 20);
+          tierLabel = 'Kindred Trending';
+        }
+        return { title: item.item_name, type, reason, matchScore, tier: item.tier, tierLabel };
+      });
+
+      setRecs(finalRecs);
+      setAiFallbackRecs(aiPicks);
+    } catch (e) {
+      setRecError('Could not load recommendations. Check your connection and try again.');
+    }
+    setRecLoading(false);
+  }
+
+  // Tier 5 only. Surfaced in the UI as "Beyond Your Taste Network" —
+  // deliberately NOT worded like the twin-backed tiers, so it never reads as
+  // equally trusted. Only called when a user has zero real-data matches
+  // anywhere in the graph (very early days, or a very sparse catalog overlap).
+  async function generateAIFallbackPicks() {
+    try {
       const fmt = (d) => Object.entries(ratings[d]).filter(([,v])=>v).map(([k,v])=>`${k}:${v}/5`).join(', ');
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           model: "claude-sonnet-4-6", max_tokens: 1000,
-          messages: [{ role: "user", content: `You are Kindred, a cross-domain taste matching platform. Generate exactly 6 personalized recommendations.
+          messages: [{ role: "user", content: `You are Kindred. This user has no taste-twin matches yet (too new, or too little catalog overlap with other users), so generate exactly 4 fallback picks based on general knowledge of their own ratings only. These are explicitly lower-trust than human-matched picks — keep that framing in mind.
 
 Film & TV ratings: ${fmt('film') || 'none rated'}
 Game ratings: ${fmt('games') || 'none rated'}
 Book ratings: ${fmt('books') || 'none rated'}
 
 Return ONLY a JSON object, no markdown, no backticks:
-{"recommendations":[{"title":"string","type":"film|show|game|book","reason":"one sentence why","matchScore":85}]}` }]
+{"recommendations":[{"title":"string","type":"film|show|game|book","reason":"one sentence why"}]}` }]
         })
       });
       const data = await res.json();
       const tb = data.content?.find(c => c.type === 'text');
-      if (!tb) throw new Error('No response');
+      if (!tb) return [];
       const parsed = JSON.parse(tb.text.replace(/```json|```/g,'').trim());
-      setRecs(parsed.recommendations);
+      return (parsed.recommendations || []).map(r => ({ ...r, tier: 5, tierLabel: 'Beyond Your Taste Network' }));
     } catch (e) {
-      setRecError('Could not load recommendations. Check your connection and try again.');
+      return [];
     }
-    setRecLoading(false);
   }
 
   // STYLES
@@ -1325,14 +1621,25 @@ Return ONLY a JSON object, no markdown, no backticks:
   // ─── RECOMMENDATIONS ───────────────────────────────────────
   if (step === 'recs') {
     const typeMap = {film:{label:'Film',color:G.purple,icon:'🎬'},show:{label:'Show',color:G.pink,icon:'📺'},game:{label:'Game',color:G.cyan,icon:'🎮'},book:{label:'Book',color:G.amber,icon:'📚'}};
+    const tierColors = { 1:G.purple, 2:G.cyan, 3:G.amber, 4:G.green };
+    async function handleBuyClick(rec) {
+      logEvent(userId,'affiliate_link_clicked',`${rec.type}:${rec.title}`);
+      const href = await buildAffiliateLink(rec.type, rec.title);
+      window.open(href, '_blank', 'noopener,noreferrer');
+    }
+    const hasRealRecs = recs && recs.length > 0;
+    const headerEyebrow = hasRealRecs ? 'BASED ON REAL TASTE TWINS' : 'AI-POWERED · CROSS-DOMAIN';
+    const headerSub = hasRealRecs
+      ? 'From people who actually match your taste — not an algorithm guessing.'
+      : "Based on everything you've rated across all domains.";
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:620,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
           <div style={{textAlign:'center',marginBottom:'2.25rem'}}>
-            <div style={{...s.eyebrow,color:G.purple}}>AI-POWERED · CROSS-DOMAIN</div>
+            <div style={{...s.eyebrow,color:G.purple}}>{headerEyebrow}</div>
             <h2 style={s.h2}>Made for your taste</h2>
-            <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>Based on everything you've rated across all domains.</p>
+            <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>{headerSub}</p>
           </div>
           {recLoading && (
             <div style={{textAlign:'center',padding:'4rem 0'}}>
@@ -1349,34 +1656,74 @@ Return ONLY a JSON object, no markdown, no backticks:
           {recs && (
             <>
               <p style={{color:G.dim,fontSize:'0.7rem',lineHeight:1.5,marginBottom:'1rem'}}>Kindred earns a small commission on purchases through these links, at no extra cost to you.</p>
-              <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
-                {recs.map((rec,i)=>{
-                  const cfg=typeMap[rec.type]||typeMap.film;
-                  return (
-                    <div key={i} className="k-rec" style={{...s.card,transition:'all 0.2s'}}>
-                      <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
-                        <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
-                        <div style={{flex:1,minWidth:0}}>
-                          <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.35rem',flexWrap:'wrap'}}>
-                            <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
-                            <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+              {hasRealRecs && (
+                <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
+                  {recs.map((rec,i)=>{
+                    const cfg=typeMap[rec.type]||typeMap.film;
+                    const tierColor = tierColors[rec.tier] || G.purple;
+                    return (
+                      <div key={i} className="k-rec" style={{...s.card,transition:'all 0.2s'}}>
+                        <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
+                          <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                          <div style={{flex:1,minWidth:0}}>
+                            <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.3rem',flexWrap:'wrap'}}>
+                              <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
+                              <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+                            </div>
+                            <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:tierColor,textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:'0.35rem'}}>{rec.tierLabel}</div>
+                            <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
                           </div>
-                          <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
+                          <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purple,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
                         </div>
-                        <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purple,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
+                        <button onClick={()=>handleBuyClick(rec)} style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:'2.5rem',color:G.cyan,fontSize:'0.76rem',background:'none',border:'none',cursor:'pointer',fontFamily:'inherit',padding:0}}>
+                          🛒 {rec.type==='book' ? 'Find it on Bookshop' : 'Find it on Amazon'}
+                        </button>
                       </div>
-                      <a href={buildAffiliateLink(rec.type, rec.title)} target="_blank" rel="noopener noreferrer sponsored"
-                        onClick={()=>logEvent(userId,'affiliate_link_clicked',`${rec.type}:${rec.title}`)}
-                        style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:'2.5rem',color:G.cyan,fontSize:'0.76rem',textDecoration:'none'}}>
-                        🛒 Find it on Amazon
-                      </a>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
+              {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length === 0 && (
+                <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
+                  <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🌱</div>
+                  <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Your taste network is still growing</div>
+                  <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody with overlapping taste has rated enough yet. Rate a few more things or share Kindred with friends — real recs come from real people here.</p>
+                </div>
+              )}
+              {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length > 0 && (
+                <div style={{marginBottom:'1.25rem'}}>
+                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.75rem'}}>
+                    <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.65rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em'}}>Beyond Your Taste Network</div>
+                    <div style={{flex:1,height:1,background:G.border}}/>
+                  </div>
+                  <p style={{color:G.dim,fontSize:'0.72rem',lineHeight:1.5,marginBottom:'0.75rem'}}>No human taste-twin matches yet, so these are AI-generated guesses based only on your own ratings — lower trust than picks above this line.</p>
+                  <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+                    {aiFallbackRecs.map((rec,i)=>{
+                      const cfg=typeMap[rec.type]||typeMap.film;
+                      return (
+                        <div key={i} className="k-rec" style={{...s.card,border:`1px dashed ${G.border}`,transition:'all 0.2s'}}>
+                          <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
+                            <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                            <div style={{flex:1,minWidth:0}}>
+                              <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.35rem',flexWrap:'wrap'}}>
+                                <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
+                                <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+                              </div>
+                              <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
+                            </div>
+                          </div>
+                          <button onClick={()=>handleBuyClick(rec)} style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:'2.5rem',color:G.cyan,fontSize:'0.76rem',background:'none',border:'none',cursor:'pointer',fontFamily:'inherit',padding:0}}>
+                            🛒 {rec.type==='book' ? 'Find it on Bookshop' : 'Find it on Amazon'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
               <div style={{display:'grid',gridTemplateColumns:'1fr 2fr',gap:'0.75rem'}}>
                 <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>setStep('quiz')}>Rate More</button>
-                <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>{setRecs(null);generateRecs();}}>Refresh Recs ↺</button>
+                <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>{setRecs(null);setAiFallbackRecs([]);generateRecs();}}>Refresh Recs ↺</button>
               </div>
             </>
           )}
@@ -1384,6 +1731,7 @@ Return ONLY a JSON object, no markdown, no backticks:
       </div>
     );
   }
+
 
   return null;
 }

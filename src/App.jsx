@@ -4,14 +4,21 @@ import { supabase } from "./supabaseClient";
 import Papa from "papaparse";
 import html2canvas from "html2canvas";
 
+// ─── DESIGN SYSTEM TOKENS (Claude Design visual pass) ──────────
+// Ported from the Kindred Taste-Matching Visual System handoff. Mood-axis
+// tokens (cyan as a 3rd archetype axis) were intentionally dropped — the
+// real app only has category + behavior, no mood data exists anywhere to
+// back a 3-axis display. Cyan stays in the palette for general UI accents
+// (it's a nice color) but is no longer reserved for archetype display.
 const G = {
-  bg:'#080B16', deep:'#0D1120', card:'rgba(255,255,255,0.04)',
-  border:'rgba(255,255,255,0.08)', purple:'#8B5CF6', purpleDim:'rgba(139,92,246,0.12)',
-  cyan:'#06B6D4', amber:'#F59E0B', green:'#10B981', pink:'#EC4899',
-  text:'#F1F5F9', muted:'#94A3B8', dim:'#475569',
+  bg:'#0D0D14', deep:'#13131b', card:'rgba(255,255,255,0.03)',
+  border:'#2A2A36', borderDim:'#1A1A23',
+  purple:'#6C5DD3', purpleLight:'#9D92F0', purpleDim:'rgba(108,93,211,0.08)',
+  cyan:'#00D4FF', amber:'#F59E0B', green:'#10B881', pink:'#FF689D', gold:'#FFD66B',
+  text:'#F5F7FA', muted:'#C4C8DA', dim:'#8B8FA6', faint:'#5B6079',
 };
 
-const FONTS = `@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300;1,400&family=Space+Mono&display=swap');`;
+const FONTS = `@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Inter:wght@400;500;600&family=Space+Mono:wght@400;700&display=swap');`;
 const TARGET = 5;
 
 const DOMAINS = [
@@ -46,9 +53,15 @@ function getExplorerLevel(totalRated) {
 // behavior words = 64 combinations, without sounding like a personality
 // quiz. Each axis still gets computed independently from real rating data.
 
+// Design system note: category tags are always the single green token
+// (#10B881) per the new visual system — the category NAME differentiates
+// them, not 8 different colors per category like the old palette did.
+// Kept as a function (not a flat constant) so call sites that destructure
+// a per-category color still work without changing every call site.
+const CATEGORY_COLOR = '#10B881';
 const CATEGORY_COLORS = {
-  'Sci-Fi':'#8B5CF6', Horror:'#EF4444', 'Literary Fiction':'#F59E0B', 'Strategy Games':'#06B6D4',
-  'Prestige Drama':'#A78BFA', Fantasy:'#10B981', Indie:'#FBBF24', Action:'#3B82F6',
+  'Sci-Fi':CATEGORY_COLOR, Horror:CATEGORY_COLOR, 'Literary Fiction':CATEGORY_COLOR, 'Strategy Games':CATEGORY_COLOR,
+  'Prestige Drama':CATEGORY_COLOR, Fantasy:CATEGORY_COLOR, Indie:CATEGORY_COLOR, Action:CATEGORY_COLOR,
 };
 
 // Best-effort keyword match against real rated titles. With the catalog now
@@ -222,6 +235,38 @@ function buildWhyText(twin) {
   if (top.length === 1) return `Matched mostly on ${top[0]} — not many people have rated that one.`;
   const last = top.pop();
   return `Matched mostly on ${top.join(', ')} and ${last} — rare picks that few others share.`;
+}
+
+// ─── TASTE PASSPORT RADAR (real data, no mood axis) ────────────
+// The Claude Design handoff specifies a 9-axis radar (3 mood / 3 category /
+// 3 behavior) with named sub-scores like "Sci-Fi 45%, Psych-Horror 22%."
+// None of that exists in the real archetype system — buildArchetype only
+// ever produces ONE category and ONE behavior word, no mood axis, no
+// per-genre breakdown. Rather than invent fake sub-scores to fill out a
+// 9-point shape, this radar shows one REAL axis per domain the user has
+// actually rated in (film/games/books — so 1-3 axes, not a fixed 9), each
+// value being their average rarity-weight among their own 4-5★ ratings in
+// that domain. Rarity-weight is the same real signal twin-matching already
+// uses (computeRarityWeights) — high values mean "you tend to love things
+// few other people have rated," which is genuinely what makes someone's
+// taste distinctive, without claiming any number that isn't true.
+function buildRarityRadarData(ratings, allTastes) {
+  const rarityWeights = computeRarityWeights(allTastes);
+  const domainLabels = { film: 'Film & TV', games: 'Games', books: 'Books' };
+  const axes = [];
+
+  Object.entries(domainLabels).forEach(([domain, label]) => {
+    const loved = Object.entries(ratings[domain] || {}).filter(([, v]) => v >= 4);
+    if (loved.length === 0) return; // no real signal in this domain — omit the axis rather than show a fake 0
+    const weights = loved.map(([title]) => rarityWeights[`${domain}:${title}`] || 1);
+    const avgWeight = weights.reduce((a, b) => a + b, 0) / weights.length;
+    // Rarity weights range roughly 0.3-3 (see computeRarityWeights) — normalize
+    // to a 0-1 display value for the radar's plotting math.
+    const normalized = Math.max(0.15, Math.min(1, (avgWeight - 0.3) / 2.7));
+    axes.push({ label, value: normalized, count: loved.length });
+  });
+
+  return axes;
 }
 
 // ─── 5-TIER RECOMMENDATION ENGINE ─────────────────────────────
@@ -444,17 +489,99 @@ function playtimeToStars(minutes) {
 // screen Taste Passport / Twin cards but strips anything meaningless to a
 // viewer who isn't the account owner (e.g. the freshness bar).
 
+// Radar chart — ported from the Claude Design handoff's _initRadar, adapted
+// from a fixed 9-axis vanilla-JS DOM builder into a React component that
+// takes a real, variable-length axes array (1-3 axes here, not always 9).
+// Single category-green value polygon — no mood/behavior groups, since
+// there's only one real signal type (rarity-weight per domain) to plot.
+function PassportRadar({ axes, size = 280 }) {
+  if (!axes || axes.length === 0) return null;
+  const W = size, H = size, cx = W / 2, cy = H / 2, R = size * 0.34;
+  const n = axes.length;
+  const ang = i => (-Math.PI / 2) + (i / n) * Math.PI * 2;
+  const pt = (i, r) => [cx + Math.cos(ang(i)) * r, cy + Math.sin(ang(i)) * r];
+
+  const rings = [0.25, 0.5, 0.75, 1].map((f, ri) => {
+    const ptsStr = axes.map((_, i) => pt(i, R * f).join(',')).join(' ');
+    return <polygon key={ri} points={ptsStr} fill="none" stroke={`rgba(255,255,255,${f === 1 ? 0.12 : 0.05})`} strokeWidth="1" />;
+  });
+
+  const spokesAndLabels = axes.map((a, i) => {
+    const [x, y] = pt(i, R);
+    const [lx, ly] = pt(i, R + 22);
+    const cosA = Math.cos(ang(i));
+    const anchor = Math.abs(cosA) < 0.3 ? 'middle' : (cosA > 0 ? 'start' : 'end');
+    return (
+      <g key={i}>
+        <line x1={cx} y1={cy} x2={x} y2={y} stroke="rgba(255,255,255,0.05)" strokeWidth="1" />
+        <text x={lx} y={ly} fill={G.green} opacity="0.85" fontFamily="'Space Mono',monospace" fontSize="9" letterSpacing="0.06em" textAnchor={anchor} dominantBaseline="middle">
+          {a.label.toUpperCase()}
+        </text>
+      </g>
+    );
+  });
+
+  const valPts = axes.map((a, i) => pt(i, R * a.value));
+  const valPolyStr = valPts.map(p => p.join(',')).join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height: '100%', overflow: 'visible' }}>
+      {rings}
+      {spokesAndLabels}
+      <polygon points={valPolyStr} fill="rgba(108,93,211,0.18)" stroke="rgba(108,93,211,0.9)" strokeWidth="1.5" strokeLinejoin="round" />
+      {valPts.map((p, i) => (
+        <circle key={i} cx={p[0]} cy={p[1]} r="3.2" fill={G.green} stroke={G.bg} strokeWidth="1.5" />
+      ))}
+    </svg>
+  );
+}
+
+// Constellation canvas background — ported from the design handoff's shared
+// _makeSim/_draw logic (identical across every .dc.html file). Reusable
+// behind any card/hero surface. color is an "r,g,b" string per the design
+// tokens (purple 108,93,211 / pink 255,104,157 / cyan 0,212,255).
+function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500 }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.offsetWidth, h = canvas.offsetHeight;
+    if (!w || !h) return;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    const n = Math.max(8, Math.round((w * h) / density));
+    const pts = [];
+    for (let i = 0; i < n; i++) pts.push({ x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-.5)*.12, vy:(Math.random()-.5)*.12, r: Math.random()*1.2+.4, tw: Math.random()*Math.PI*2 });
+    let raf;
+    const draw = () => {
+      ctx.clearRect(0, 0, w, h);
+      for (const p of pts) { p.x += p.vx; p.y += p.vy; p.tw += .02; if (p.x<0||p.x>w) p.vx*=-1; if (p.y<0||p.y>h) p.vy*=-1; }
+      for (let i = 0; i < pts.length; i++) for (let j = i+1; j < pts.length; j++) {
+        const a = pts[i], b = pts[j]; const d = Math.hypot(a.x-b.x, a.y-b.y);
+        if (d < 64) { ctx.strokeStyle = `rgba(${color},${.12*(1-d/64)})`; ctx.lineWidth = .6; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+      }
+      for (const p of pts) { const a = .35+.4*Math.sin(p.tw); ctx.fillStyle = `rgba(${color},${a})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); }
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [color, density]);
+  return <canvas ref={canvasRef} style={{ position:'absolute', inset:0, width:'100%', height:'100%', opacity }} />;
+}
+
 function PassportShareCard({ archetype, level, total }) {
   return (
     <div style={{
-      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, #150B2E)`,
+      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, ${G.deep})`,
       display:'flex', flexDirection:'column', justifyContent:'center', padding:'90px',
       fontFamily:"'Inter',system-ui,sans-serif", color:G.text, boxSizing:'border-box', position:'relative',
     }}>
       <div style={{position:'absolute', top:70, left:90, fontFamily:"'Cormorant Garamond',serif", fontSize:38, fontWeight:500, letterSpacing:'0.04em'}}>
         Kind<span style={{color:G.purple}}>r</span>ed
       </div>
-      <div style={{position:'absolute', top:78, right:90, background:'rgba(139,92,246,0.18)', border:'1px solid rgba(139,92,246,0.35)', borderRadius:100, padding:'10px 28px', fontSize:22, color:'#C4B5D9', fontFamily:'Space Mono,monospace'}}>{level}</div>
+      <div style={{position:'absolute', top:78, right:90, background:'rgba(108,93,211,0.18)', border:'1px solid rgba(108,93,211,0.35)', borderRadius:100, padding:'10px 28px', fontSize:22, color:'#9D92F0', fontFamily:'Space Mono,monospace'}}>{level}</div>
       <div style={{fontFamily:'Space Mono,monospace', fontSize:24, color:G.purple, textTransform:'uppercase', letterSpacing:'0.16em', marginBottom:28}}>Taste Passport</div>
       <div style={{fontFamily:"'Cormorant Garamond',serif", fontWeight:300, fontSize:74, lineHeight:1.18, marginBottom:48}}>
         <span style={{color:archetype.categoryColor}}>{archetype.category}</span>{' '}
@@ -473,7 +600,7 @@ function PassportShareCard({ archetype, level, total }) {
 function TwinShareCard({ twin }) {
   return (
     <div style={{
-      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, #150B2E)`,
+      width:1080, height:1080, background:`linear-gradient(135deg, ${G.bg}, ${G.deep})`,
       display:'flex', flexDirection:'column', justifyContent:'center', padding:'90px',
       fontFamily:"'Inter',system-ui,sans-serif", color:G.text, boxSizing:'border-box', position:'relative',
     }}>
@@ -486,7 +613,7 @@ function TwinShareCard({ twin }) {
         <div style={{fontSize:34, color:G.muted}}>match with {twin.handle}</div>
       </div>
       {twin.why && (
-        <div style={{background:'rgba(139,92,246,0.08)', border:'1px solid rgba(139,92,246,0.2)', borderRadius:18, padding:'32px 36px', marginBottom:48, fontSize:28, color:'#C4B5D9', lineHeight:1.5}}>
+        <div style={{background:'rgba(108,93,211,0.08)', border:'1px solid rgba(108,93,211,0.2)', borderRadius:18, padding:'32px 36px', marginBottom:48, fontSize:28, color:'#9D92F0', lineHeight:1.5}}>
           💡 {twin.why}
         </div>
       )}
@@ -495,7 +622,7 @@ function TwinShareCard({ twin }) {
           <div style={{fontFamily:'Space Mono,monospace', fontSize:22, color:G.dim, textTransform:'uppercase', letterSpacing:'0.12em', marginBottom:20}}>You both loved</div>
           <div style={{display:'flex', flexWrap:'wrap', gap:14}}>
             {twin.shared.slice(0,4).map((s,i)=>(
-              <span key={i} style={{background:G.purpleDim, border:'1px solid rgba(139,92,246,0.25)', color:'#C4B5D9', padding:'12px 26px', borderRadius:100, fontSize:26}}>{s.title}</span>
+              <span key={i} style={{background:G.purpleDim, border:'1px solid rgba(108,93,211,0.25)', color:'#9D92F0', padding:'12px 26px', borderRadius:100, fontSize:26}}>{s.title}</span>
             ))}
           </div>
         </div>
@@ -623,6 +750,10 @@ export default function KindredApp() {
   const [twinsLoading, setTwinsLoading] = useState(false);
   const [twinsError, setTwinsError] = useState(null);
   const [copiedId, setCopiedId] = useState(null);
+  // Scoped to the Passport screen's radar — a small fetch of the same
+  // platform-wide tastes table fetchRealTwins already queries, just used
+  // here for the real rarity-by-domain radar instead of twin matching.
+  const [radarTastes, setRadarTastes] = useState(null);
   // Discord account-linking state — a short code the user types into the
   // bot via /link, generated on demand and expiring after 10 minutes so a
   // stale code can't be reused later by mistake.
@@ -961,6 +1092,15 @@ export default function KindredApp() {
     if (step === 'twins' && realTwins === null && !twinsLoading && totalRated() >= TWIN_UNLOCK_THRESHOLD) fetchRealTwins();
   }, [step]);
 
+  // Fetches the platform-wide tastes table for the Passport screen's real
+  // rarity-by-domain radar (same data fetchRealTwins uses, just a separate
+  // small fetch scoped to this screen rather than a shared global cache).
+  useEffect(() => {
+    if (step !== 'profile' || radarTastes !== null) return;
+    supabase.from('tastes').select('user_id, category, item_name, rating')
+      .then(({ data, error }) => { if (!error && data) setRadarTastes(data); });
+  }, [step]);
+
   async function sharePassport(level, archetype, total) {
     const archetypeLabel = `${archetype.category} ${archetype.behavior}`;
     logEvent(userId, 'taste_passport_shared', archetypeLabel);
@@ -1145,17 +1285,17 @@ Return ONLY a JSON object, no markdown, no backticks:
     @keyframes spin{to{transform:rotate(360deg)}}
     @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
     @keyframes slideIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
-    .k-btn:hover{background:#7C3AED!important;transform:translateY(-1px)}
+    .k-btn:hover{background:#5d4fc0!important;transform:translateY(-1px)}
     .k-out:hover{border-color:rgba(255,255,255,0.2)!important;color:#F1F5F9!important}
     .k-tab:hover{border-color:rgba(255,255,255,0.15)!important}
     .k-result:hover{border-color:rgba(255,255,255,0.15)!important;background:rgba(255,255,255,0.06)!important}
     .k-star:hover{transform:scale(1.2)!important}
-    .k-twin:hover{border-color:rgba(139,92,246,0.3)!important;transform:translateY(-2px)}
-    .k-rec:hover{border-color:rgba(139,92,246,0.25)!important}
+    .k-twin:hover{border-color:rgba(108,93,211,0.3)!important;transform:translateY(-2px)}
+    .k-rec:hover{border-color:rgba(108,93,211,0.25)!important}
     .slide-in{animation:slideIn 0.4s ease forwards}
     .fade-up{animation:fadeUp 0.4s ease forwards}
-    .k-input:focus{border-color:#8B5CF6!important;outline:none}
-    .k-search:focus{border-color:#8B5CF6!important;outline:none}
+    .k-input:focus{border-color:#6C5DD3!important;outline:none}
+    .k-search:focus{border-color:#6C5DD3!important;outline:none}
   `;
 
   // ─── WELCOME ───────────────────────────────────────────────
@@ -1171,9 +1311,10 @@ Return ONLY a JSON object, no markdown, no backticks:
 
   // ─── WELCOME / SIGN IN ─────────────────────────────────────────
   if (step === 'welcome') return (
-    <div style={s.app}>
+    <div style={{...s.app,position:'relative',overflow:'hidden'}}>
       <style>{FONTS+css}</style>
-      <div style={s.center}>
+      <ConstellationBg color="108,93,211" opacity={0.35} density={5000} />
+      <div style={{...s.center,position:'relative'}}>
         <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'2rem',fontWeight:500,marginBottom:'2.5rem',letterSpacing:'0.06em'}}>
           Kind<span style={{color:G.purple}}>r</span>ed
         </div>
@@ -1325,7 +1466,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                             onMouseEnter={()=>setHoveredStar(h=>({...h,[hk]:star}))}
                             onMouseLeave={()=>setHoveredStar(h=>({...h,[hk]:0}))}
                             style={{background:'none',border:'none',cursor:'pointer',fontSize:'1rem',padding:'0.1rem',
-                              transition:'transform 0.12s',lineHeight:1,color:filled?domInfo.color:'rgba(255,255,255,0.2)'}}>
+                              transition:'transform 0.12s',lineHeight:1,color:filled?G.gold:G.border}}>
                             ★
                           </button>
                         );
@@ -1361,7 +1502,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                 {ratedTitles.map(([title, stars]) => (
                   <div key={title} style={{display:'flex',alignItems:'center',gap:'0.75rem',padding:'0.5rem 0.875rem',background:G.card,border:`1px solid ${domInfo.color}33`,borderRadius:10}}>
                     <span style={{flex:1,fontSize:'0.83rem',fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{title}</span>
-                    <span style={{color:domInfo.color,fontSize:'0.78rem',fontFamily:'Space Mono,monospace',flexShrink:0}}>{'★'.repeat(stars)}{'☆'.repeat(5-stars)}</span>
+                    <span style={{color:G.gold,fontSize:'0.78rem',fontFamily:'Space Mono,monospace',flexShrink:0}}>{'★'.repeat(stars)}{'☆'.repeat(5-stars)}</span>
                     <button onClick={()=>setRating(quizDomain,title,undefined)} style={{background:'none',border:'none',cursor:'pointer',color:G.dim,fontSize:'0.65rem',padding:'0 0.2rem',fontFamily:'inherit',flexShrink:0}}>✕</button>
                   </div>
                 ))}
@@ -1467,7 +1608,7 @@ Return ONLY a JSON object, no markdown, no backticks:
               <div style={{display:'flex',flexDirection:'column',gap:'0.3rem',marginBottom:'1rem'}}>
                 {importPreview.items.slice(0,5).map((it,i)=>(
                   <div key={i} style={{fontSize:'0.78rem',color:G.muted,display:'flex',justifyContent:'space-between'}}>
-                    <span>{it.title}</span><span style={{color:G.purple,fontFamily:'Space Mono,monospace'}}>{'★'.repeat(it.rating)}</span>
+                    <span>{it.title}</span><span style={{color:G.gold,fontFamily:'Space Mono,monospace'}}>{'★'.repeat(it.rating)}</span>
                   </div>
                 ))}
                 {importPreview.items.length>5 && <div style={{fontSize:'0.75rem',color:G.dim}}>+ {importPreview.items.length-5} more</div>}
@@ -1626,40 +1767,73 @@ Return ONLY a JSON object, no markdown, no backticks:
     const level = getExplorerLevel(total);
     const archetype = buildArchetype(username || email || 'kindred', ratings);
     const fresh = getFreshness(total);
+    const radarAxes = buildRarityRadarData(ratings, radarTastes || []);
 
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:560,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
 
-          {/* PASSPORT CARD */}
-          <div style={{background:`linear-gradient(135deg, ${G.purpleDim}, rgba(6,182,212,0.06))`,border:`1px solid rgba(139,92,246,0.25)`,borderRadius:20,padding:'1.75rem 1.5rem',marginBottom:'1.25rem',position:'relative',overflow:'hidden'}}>
-            <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:'1rem'}}>
-              <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.purple,textTransform:'uppercase',letterSpacing:'0.12em'}}>Taste Passport</div>
-              <div style={{background:'rgba(139,92,246,0.18)',border:'1px solid rgba(139,92,246,0.3)',borderRadius:100,padding:'0.25rem 0.75rem',fontSize:'0.68rem',color:'#C4B5D9',fontFamily:'Space Mono,monospace'}}>{level}</div>
-            </div>
-            <h2 style={{...s.h2,marginBottom:'0.4rem',fontSize:'clamp(1.5rem,3.5vw,2.1rem)'}}>
-              <span style={{color:archetype.categoryColor}}>{archetype.category}</span>{' '}
-              <span>{archetype.behavior}</span>
-            </h2>
-            <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'1.25rem'}}>{total} items rated across film, games, and books</p>
-            <CompletionWidget ratings={ratings} />
-            <div style={{marginBottom:'1.25rem'}}>
-              <div style={{display:'flex',justifyContent:'space-between',fontSize:'0.7rem',color:G.muted,marginBottom:'0.4rem'}}>
-                <span>Profile Freshness</span>
-                <span style={{fontFamily:'Space Mono,monospace',color:fresh.pct===100?G.green:G.amber}}>{fresh.pct}%</span>
+          {/* PASSPORT CARD — collectible card per Claude Design handoff */}
+          <div style={{position:'relative',border:`1px solid ${G.border}`,borderRadius:24,overflow:'hidden',background:`linear-gradient(180deg, ${G.deep}, ${G.bg})`,marginBottom:'1.25rem'}}>
+            <ConstellationBg color="108,93,211" opacity={0.4} />
+            <div style={{position:'absolute',top:14,left:14,width:14,height:14,borderTop:'1px solid #46465a',borderLeft:'1px solid #46465a'}}/>
+            <div style={{position:'absolute',top:14,right:14,width:14,height:14,borderTop:'1px solid #46465a',borderRight:'1px solid #46465a'}}/>
+            <div style={{position:'absolute',bottom:14,left:14,width:14,height:14,borderBottom:'1px solid #46465a',borderLeft:'1px solid #46465a'}}/>
+            <div style={{position:'absolute',bottom:14,right:14,width:14,height:14,borderBottom:'1px solid #46465a',borderRight:'1px solid #46465a'}}/>
+
+            <div style={{position:'relative',padding:'1.4rem 1.4rem 1.6rem'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.16em',color:G.dim}}>
+                <span>KINDRED · PASSPORT</span>
+                <span style={{color:fresh.pct===100?G.green:G.cyan}}>{fresh.pct}% COMPLETE</span>
               </div>
-              <div style={{height:4,background:'rgba(255,255,255,0.08)',borderRadius:2,overflow:'hidden',marginBottom:'0.5rem'}}>
-                <div style={{height:'100%',width:`${fresh.pct}%`,background:fresh.pct===100?G.green:G.amber,borderRadius:2,transition:'width 0.6s ease'}}/>
+
+              {radarAxes.length > 0 ? (
+                <div style={{position:'relative',height:220,marginTop:'0.5rem'}}>
+                  <PassportRadar axes={radarAxes} size={260} />
+                </div>
+              ) : (
+                <div style={{height:140,display:'flex',alignItems:'center',justifyContent:'center',color:G.dim,fontSize:'0.82rem',textAlign:'center',padding:'0 1rem'}}>
+                  Rate a few 4-5★ things to start filling in your radar.
+                </div>
+              )}
+
+              <div style={{textAlign:'center',marginTop:'0.2rem'}}>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.28em',color:G.dim}}>YOUR ARCHETYPE</div>
+                <div style={{fontFamily:"'Cormorant Garamond',serif",fontStyle:'italic',fontWeight:400,fontSize:'1.6rem',color:G.text,marginTop:'0.25rem',lineHeight:1.1}}>
+                  <span style={{color:archetype.categoryColor,fontStyle:'normal'}}>{archetype.category}</span>{' '}{archetype.behavior}
+                </div>
+                <div style={{background:'rgba(108,93,211,0.18)',border:'1px solid rgba(108,93,211,0.3)',borderRadius:100,padding:'0.25rem 0.75rem',fontSize:'0.68rem',color:G.purpleLight,fontFamily:'Space Mono,monospace',display:'inline-block',marginTop:'0.6rem'}}>{level}</div>
               </div>
-              <p style={{color:G.dim,fontSize:'0.72rem',margin:0}}>
-                {fresh.remaining===0 ? 'Your profile is fresh!' : `Rate ${fresh.remaining} more thing${fresh.remaining===1?'':'s'} to refresh it.`}
-              </p>
             </div>
-            <button onClick={()=>sharePassport(level,archetype,total)} style={{width:'100%',background:'transparent',border:`1px solid rgba(139,92,246,0.3)`,color:copiedId==='passport'?G.green:'#C4B5D9',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
-              {copiedId==='passport' ? '✓ Shared as image' : '🔗 Share My Taste Passport'}
-            </button>
           </div>
+
+          {/* legend — single real series (rarity by domain). No behavior/mood
+              legend entries since the radar only plots the one real signal. */}
+          {radarAxes.length > 0 && (
+            <div style={{display:'flex',justifyContent:'center',gap:'1.1rem',marginBottom:'1.25rem'}}>
+              <div style={{display:'flex',alignItems:'center',gap:'0.4rem'}}><span style={{width:9,height:9,borderRadius:'50%',background:G.green,display:'inline-block'}}/><span style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.08em',color:G.dim}}>RARITY BY DOMAIN</span></div>
+            </div>
+          )}
+
+          <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'1.25rem',textAlign:'center'}}>{total} items rated across film, games, and books</p>
+
+          <div style={{marginBottom:'1.25rem'}}>
+            <div style={{display:'flex',justifyContent:'space-between',fontSize:'0.7rem',color:G.muted,marginBottom:'0.4rem'}}>
+              <span>Profile Freshness</span>
+              <span style={{fontFamily:'Space Mono,monospace',color:fresh.pct===100?G.green:G.amber}}>{fresh.pct}%</span>
+            </div>
+            <div style={{height:4,background:'rgba(255,255,255,0.08)',borderRadius:2,overflow:'hidden',marginBottom:'0.5rem'}}>
+              <div style={{height:'100%',width:`${fresh.pct}%`,background:fresh.pct===100?G.green:G.amber,borderRadius:2,transition:'width 0.6s ease'}}/>
+            </div>
+            <p style={{color:G.dim,fontSize:'0.72rem',margin:0,textAlign:'center'}}>
+              {fresh.remaining===0 ? 'Your profile is fresh!' : `Rate ${fresh.remaining} more thing${fresh.remaining===1?'':'s'} to refresh it.`}
+            </p>
+          </div>
+
+          <button onClick={()=>sharePassport(level,archetype,total)} style={{width:'100%',background:G.pink,color:'#1a0a12',border:'none',borderRadius:14,padding:'0.9rem',fontSize:'0.92rem',fontWeight:600,cursor:'pointer',fontFamily:'Inter,sans-serif',marginBottom:'1.5rem',transition:'all 0.2s'}}>
+            {copiedId==='passport' ? '✓ Shared as image' : '⇪ Share your Passport'}
+          </button>
 
           <div style={{...s.card,marginBottom:'1rem'}}>
             <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'1.25rem'}}>Average Rating by Domain</div>
@@ -1683,7 +1857,7 @@ Return ONLY a JSON object, no markdown, no backticks:
           <div style={{...s.card,marginBottom:'1.25rem'}}>
             <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.875rem'}}>Taste Tags</div>
             <div style={{display:'flex',flexWrap:'wrap',gap:'0.5rem'}}>
-              {tags.map(t=>(<span key={t} style={{background:G.purpleDim,border:'1px solid rgba(139,92,246,0.2)',color:'#C4B5D9',padding:'0.35rem 0.875rem',borderRadius:100,fontSize:'0.76rem'}}>{t}</span>))}
+              {tags.map(t=>(<span key={t} style={{background:G.purpleDim,border:'1px solid rgba(108,93,211,0.2)',color:'#9D92F0',padding:'0.35rem 0.875rem',borderRadius:100,fontSize:'0.76rem'}}>{t}</span>))}
             </div>
           </div>
           <div style={{display:'flex',gap:'0.75rem',marginBottom:'1rem'}}>
@@ -1702,7 +1876,7 @@ Return ONLY a JSON object, no markdown, no backticks:
             ) : linkCode ? (
               <>
                 <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'0.75rem'}}>In Discord, type this command:</p>
-                <div style={{background:G.purpleDim,border:'1px solid rgba(139,92,246,0.25)',borderRadius:10,padding:'0.75rem 1rem',fontFamily:'Space Mono,monospace',fontSize:'0.95rem',color:'#C4B5D9',textAlign:'center',marginBottom:'0.5rem'}}>
+                <div style={{background:G.purpleDim,border:'1px solid rgba(108,93,211,0.25)',borderRadius:10,padding:'0.75rem 1rem',fontFamily:'Space Mono,monospace',fontSize:'0.95rem',color:'#9D92F0',textAlign:'center',marginBottom:'0.5rem'}}>
                   /link {linkCode}
                 </div>
                 <p style={{color:G.dim,fontSize:'0.72rem',margin:0}}>Expires in 10 minutes. This combines your Discord ratings with this account.</p>
@@ -1710,7 +1884,7 @@ Return ONLY a JSON object, no markdown, no backticks:
             ) : (
               <>
                 <p style={{color:G.muted,fontSize:'0.82rem',marginBottom:'0.75rem'}}>Connect your Discord account so ratings and twins are shared across both.</p>
-                <button onClick={generateLinkCode} disabled={linkCodeLoading} style={{width:'100%',background:'transparent',border:`1px solid rgba(139,92,246,0.3)`,color:'#C4B5D9',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:linkCodeLoading?'default':'pointer',fontFamily:'inherit',opacity:linkCodeLoading?0.6:1,transition:'all 0.2s'}}>
+                <button onClick={generateLinkCode} disabled={linkCodeLoading} style={{width:'100%',background:'transparent',border:`1px solid rgba(108,93,211,0.3)`,color:'#9D92F0',padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:linkCodeLoading?'default':'pointer',fontFamily:'inherit',opacity:linkCodeLoading?0.6:1,transition:'all 0.2s'}}>
                   {linkCodeLoading ? 'Generating…' : 'Connect Discord'}
                 </button>
               </>
@@ -1778,46 +1952,56 @@ Return ONLY a JSON object, no markdown, no backticks:
             </div>
           )}
           {!twinsLoading && realTwins && realTwins.length > 0 && (
-            <div style={{display:'flex',flexDirection:'column',gap:'0.875rem',marginBottom:'1.25rem'}}>
+            <div style={{display:'flex',flexDirection:'column',gap:'1.25rem',marginBottom:'1.25rem'}}>
               {realTwins.map(twin => (
-                <div key={twin.id} className="k-twin" style={{...s.card,transition:'all 0.2s',cursor:'default'}}>
-                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'1.25rem'}}>
-                    <div style={{display:'flex',alignItems:'center',gap:'0.875rem'}}>
-                      <div style={{width:44,height:44,borderRadius:'50%',background:'rgba(139,92,246,0.15)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1.15rem',flexShrink:0}}>🧬</div>
-                      <div>
-                        <div style={{fontWeight:500,fontSize:'0.88rem'}}>{twin.handle}</div>
-                        <div style={{color:G.dim,fontSize:'0.73rem',marginTop:'0.15rem'}}>{twin.overlap} titles in common</div>
+                <div key={twin.id} className="k-twin" style={{borderRadius:20,transition:'all 0.2s'}}>
+                  <div style={{position:'relative',border:`1px solid ${G.border}`,borderRadius:'20px 20px 0 0',overflow:'hidden',background:`linear-gradient(180deg, ${G.deep}, ${G.bg})`,borderBottom:'none'}}>
+                    <ConstellationBg color="255,104,157" opacity={0.3} density={9000} />
+                    <div style={{position:'absolute',top:12,left:12,width:12,height:12,borderTop:'1px solid #46465a',borderLeft:'1px solid #46465a'}}/>
+                    <div style={{position:'absolute',top:12,right:12,width:12,height:12,borderTop:'1px solid #46465a',borderRight:'1px solid #46465a'}}/>
+                    <div style={{position:'relative',padding:'1.3rem'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.16em',color:G.dim}}>
+                        <span>KINDRED · TASTE TWIN</span><span style={{color:G.pink}}>{twin.handle}</span>
                       </div>
-                    </div>
-                    <div style={{textAlign:'right',flexShrink:0,marginLeft:'0.875rem'}}>
-                      <div style={{fontFamily:'Space Mono,monospace',fontSize:'1.65rem',color:G.purple,fontWeight:700,lineHeight:1}}>{twin.overall}%</div>
-                      <div style={{fontSize:'0.65rem',color:G.dim}}>match</div>
+                      <div style={{textAlign:'center',marginTop:'0.5rem'}}>
+                        <div style={{position:'relative',width:64,height:64,margin:'0 auto',borderRadius:'50%',background:`radial-gradient(circle at 38% 32%, ${G.pink}, ${G.purple})`,display:'flex',alignItems:'center',justifyContent:'center',boxShadow:`0 0 28px rgba(255,104,157,0.4)`}}>
+                          <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'1.7rem',color:'#fff'}}>{twin.handle?.replace('@','')[0]?.toUpperCase() || '?'}</span>
+                        </div>
+                        <div style={{fontFamily:"'Cormorant Garamond',serif",fontWeight:300,fontSize:'2.6rem',lineHeight:1,color:G.text,marginTop:'0.6rem'}}>
+                          {twin.overall}<span style={{fontSize:'1rem',color:G.pink}}>%</span>
+                        </div>
+                        <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.28em',color:G.dim,marginTop:'0.15rem'}}>TASTE MATCH</div>
+                        <div style={{fontFamily:"'Cormorant Garamond',serif",fontWeight:400,fontSize:'1.25rem',color:G.text,marginTop:'0.6rem'}}>{twin.handle}</div>
+                        <div style={{color:G.dim,fontSize:'0.73rem',marginTop:'0.2rem'}}>{twin.overlap} titles in common</div>
+                      </div>
                     </div>
                   </div>
-                  {twin.why && (
-                    <div style={{background:'rgba(139,92,246,0.06)',border:'1px solid rgba(139,92,246,0.15)',borderRadius:10,padding:'0.7rem 0.875rem',marginBottom:'1rem',fontSize:'0.78rem',color:'#C4B5D9',lineHeight:1.5}}>
-                      💡 {twin.why}
-                    </div>
-                  )}
-                  <div style={{display:'flex',gap:'0.5rem',marginBottom:twin.shared?.length?'1rem':'0'}}>
-                    {DOMAINS.map(d => twin.domains[d.key]!==null && (
-                      <div key={d.key} style={{flex:1,background:'rgba(255,255,255,0.03)',borderRadius:8,padding:'0.5rem',textAlign:'center'}}>
-                        <div style={{fontSize:'0.8rem',marginBottom:'0.2rem'}}>{d.icon}</div>
-                        <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.7rem',color:G.purple,fontWeight:700}}>{twin.domains[d.key]}%</div>
+                  <div style={{...s.card,borderRadius:'0 0 20px 20px',borderTop:'none'}}>
+                    {twin.why && (
+                      <div style={{background:G.purpleDim,border:'1px solid rgba(108,93,211,0.2)',borderRadius:10,padding:'0.7rem 0.875rem',marginBottom:'1rem',fontSize:'0.78rem',color:G.purpleLight,lineHeight:1.5}}>
+                        💡 {twin.why}
                       </div>
-                    ))}
+                    )}
+                    <div style={{display:'flex',gap:'0.5rem',marginBottom:twin.shared?.length?'1rem':'0'}}>
+                      {DOMAINS.map(d => twin.domains[d.key]!==null && (
+                        <div key={d.key} style={{flex:1,background:'rgba(255,255,255,0.03)',borderRadius:8,padding:'0.5rem',textAlign:'center'}}>
+                          <div style={{fontSize:'0.8rem',marginBottom:'0.2rem'}}>{d.icon}</div>
+                          <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.7rem',color:G.purpleLight,fontWeight:700}}>{twin.domains[d.key]}%</div>
+                        </div>
+                      ))}
+                    </div>
+                    {twin.shared?.length > 0 && (
+                      <div style={{marginBottom:'0.875rem'}}>
+                        <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.5rem'}}>Shared favorites</div>
+                        <div style={{display:'flex',flexWrap:'wrap',gap:'0.4rem'}}>
+                          {twin.shared.map((sh,i)=>(<span key={i} style={{background:G.purpleDim,border:'1px solid rgba(108,93,211,0.2)',color:G.purpleLight,padding:'0.25rem 0.7rem',borderRadius:100,fontSize:'0.7rem'}}>{sh.title}</span>))}
+                        </div>
+                      </div>
+                    )}
+                    <button onClick={()=>shareTwin(twin)} style={{width:'100%',background:G.pink,color:'#1a0a12',border:'none',borderRadius:11,padding:'0.7rem',fontSize:'0.85rem',fontWeight:600,cursor:'pointer',fontFamily:'Inter,sans-serif',transition:'all 0.2s'}}>
+                      {copiedId===twin.id ? '✓ Shared as image' : '⇪ Share this match'}
+                    </button>
                   </div>
-                  {twin.shared?.length > 0 && (
-                    <div style={{marginBottom:'0.875rem'}}>
-                      <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.5rem'}}>You both loved</div>
-                      <div style={{display:'flex',flexWrap:'wrap',gap:'0.4rem'}}>
-                        {twin.shared.map((s,i)=>(<span key={i} style={{background:G.purpleDim,border:'1px solid rgba(139,92,246,0.2)',color:'#C4B5D9',padding:'0.25rem 0.7rem',borderRadius:100,fontSize:'0.7rem'}}>{s.title}</span>))}
-                      </div>
-                    </div>
-                  )}
-                  <button onClick={()=>shareTwin(twin)} style={{width:'100%',background:'transparent',border:`1px solid ${G.border}`,color:copiedId===twin.id?G.green:G.muted,padding:'0.6rem',borderRadius:10,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',transition:'all 0.2s'}}>
-                    {copiedId===twin.id ? '✓ Shared as image' : '🔗 Share this match'}
-                  </button>
                 </div>
               ))}
             </div>
@@ -1831,24 +2015,37 @@ Return ONLY a JSON object, no markdown, no backticks:
   // ─── RECOMMENDATIONS ───────────────────────────────────────
   if (step === 'recs') {
     const typeMap = {film:{label:'Film',color:G.purple,icon:'🎬'},show:{label:'Show',color:G.pink,icon:'📺'},game:{label:'Game',color:G.cyan,icon:'🎮'},book:{label:'Book',color:G.amber,icon:'📚'}};
-    const tierColors = { 1:G.purple, 2:G.cyan, 3:G.amber, 4:G.green };
+    // Tier identity per the Claude Design handoff: name, icon, trust-dot count
+    // (●●●●● down to ○○○○○), each rendered with the design's exact glyphs.
+    const tierMeta = {
+      1: { label: 'TWIN-BACKED', color: G.purple, dots: '●●●●●', icon: 'crown' },
+      2: { label: 'EXTENDED NETWORK', color: '#9a93c0', dots: '●●●●○', icon: '⁂' },
+      3: { label: 'TRENDING IN YOUR ARCHETYPE', color: '#8b8fa6', dots: '●●●○○', icon: '◈' },
+      4: { label: 'GLOBAL KINDRED TRENDING', color: '#6f7390', dots: '●●○○○', icon: '◉' },
+    };
     async function handleBuyClick(rec) {
       logEvent(userId,'affiliate_link_clicked',`${rec.type}:${rec.title}`);
       const href = await buildAffiliateLink(rec.type, rec.title);
       window.open(href, '_blank', 'noopener,noreferrer');
     }
     const hasRealRecs = recs && recs.length > 0;
-    const headerEyebrow = hasRealRecs ? 'BASED ON REAL TASTE TWINS' : 'AI-POWERED · CROSS-DOMAIN';
     const headerSub = hasRealRecs
-      ? 'From people who actually match your taste — not an algorithm guessing.'
+      ? 'Ranked by how much we trust the source — real taste twins first.'
       : "Based on everything you've rated across all domains.";
+
+    const CrownIcon = ({ size = 20 }) => (
+      <svg width={size} height={size*0.85} viewBox="0 0 24 20" style={{filter:'drop-shadow(0 0 6px rgba(108,93,211,.8))'}}>
+        <polygon points="2,18 4,5 9,11 12,3 15,11 20,5 22,18" fill={G.purple}/>
+      </svg>
+    );
+
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:620,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
-          <div style={{textAlign:'center',marginBottom:'2.25rem'}}>
-            <div style={{...s.eyebrow,color:G.purple}}>{headerEyebrow}</div>
-            <h2 style={s.h2}>Made for your taste</h2>
+          <div style={{marginBottom:'1.5rem'}}>
+            <div style={{...s.eyebrow,color:G.dim,marginBottom:0}}>FOR YOU</div>
+            <h2 style={{...s.h2,marginBottom:'0.5rem'}}>Recommendations</h2>
             <p style={{color:G.muted,fontSize:'0.85rem',lineHeight:1.65}}>{headerSub}</p>
           </div>
           {recLoading && (
@@ -1865,38 +2062,61 @@ Return ONLY a JSON object, no markdown, no backticks:
           )}
           {recs && (
             <>
-              <p style={{color:G.dim,fontSize:'0.7rem',lineHeight:1.5,marginBottom:'1rem'}}>Kindred earns a small commission on purchases through these links, at no extra cost to you.</p>
-              {hasRealRecs && (
-                <div style={{display:'flex',flexDirection:'column',gap:'0.75rem',marginBottom:'1.25rem'}}>
-                  {recs.map((rec,i)=>{
-                    const cfg=typeMap[rec.type]||typeMap.film;
-                    const tierColor = tierColors[rec.tier] || G.purple;
-                    return (
-                      <div key={i} className="k-rec" style={{...s.card,transition:'all 0.2s'}}>
-                        <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
-                          {rec.poster ? (
-                            <img src={rec.poster} alt="" style={{width:42,height:rec.type==='game'?28:60,objectFit:'cover',borderRadius:6,flexShrink:0,background:G.deep}}/>
-                          ) : (
-                            <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
-                          )}
-                          <div style={{flex:1,minWidth:0}}>
-                            <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.3rem',flexWrap:'wrap'}}>
-                              <span style={{fontWeight:600,fontSize:'0.92rem'}}>{rec.title}</span>
-                              <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
-                            </div>
-                            <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:tierColor,textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:'0.35rem'}}>{rec.tierLabel}</div>
-                            <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
-                          </div>
-                          <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purple,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
+              <p style={{color:G.dim,fontSize:'0.7rem',lineHeight:1.5,marginBottom:'1.25rem'}}>Kindred earns a small commission on purchases through these links, at no extra cost to you.</p>
+              {hasRealRecs && (() => {
+                // Group real recs by tier so each tier gets its own header
+                // block, matching the design's per-tier sections, while the
+                // underlying data/order from generateRecs() stays untouched.
+                const byTier = {};
+                recs.forEach(r => { (byTier[r.tier] = byTier[r.tier] || []).push(r); });
+                return Object.keys(byTier).sort((a,b)=>a-b).map(tierNum => {
+                  const meta = tierMeta[tierNum];
+                  const items = byTier[tierNum];
+                  return (
+                    <div key={tierNum} style={{marginBottom:'1.75rem'}}>
+                      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'0.5rem'}}>
+                        <div style={{display:'flex',alignItems:'center',gap:'0.5rem'}}>
+                          {meta.icon === 'crown' ? <CrownIcon /> : <span style={{color:meta.color,fontSize:'0.95rem'}}>{meta.icon}</span>}
+                          <span style={{fontFamily:'Space Mono,monospace',fontSize:'0.7rem',fontWeight:700,letterSpacing:'0.12em',color:meta.color}}>{meta.label}</span>
                         </div>
-                        <button onClick={()=>handleBuyClick(rec)} style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:'2.5rem',color:G.cyan,fontSize:'0.76rem',background:'none',border:'none',cursor:'pointer',fontFamily:'inherit',padding:0}}>
-                          🛒 {rec.type==='book' ? 'Find it on Bookshop' : 'Find it on Amazon'}
-                        </button>
+                        <span style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',letterSpacing:'0.14em',color:meta.color}}>{meta.dots}</span>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
+                      <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
+                        {items.map((rec,i)=>{
+                          const cfg=typeMap[rec.type]||typeMap.film;
+                          const isHero = tierNum === '1' && i === 0;
+                          return (
+                            <div key={i} className="k-rec" style={isHero ? {
+                              position:'relative',border:'1.5px solid rgba(108,93,211,0.55)',borderRadius:18,
+                              background:'linear-gradient(180deg,rgba(108,93,211,0.10),rgba(108,93,211,0.02))',
+                              boxShadow:'0 0 34px rgba(108,93,211,0.20)',padding:'1.1rem',transition:'all 0.2s'
+                            } : {...s.card,transition:'all 0.2s'}}>
+                              <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
+                                {rec.poster ? (
+                                  <img src={rec.poster} alt="" style={{width:isHero?64:42,height:rec.type==='game'?(isHero?44:28):(isHero?90:60),objectFit:'cover',borderRadius:8,flexShrink:0,background:G.deep}}/>
+                                ) : (
+                                  <span style={{fontSize:isHero?'2rem':'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
+                                )}
+                                <div style={{flex:1,minWidth:0}}>
+                                  <div style={{display:'flex',alignItems:'center',gap:'0.625rem',marginBottom:'0.3rem',flexWrap:'wrap'}}>
+                                    <span style={{fontWeight:isHero?500:600,fontSize:isHero?'1.05rem':'0.92rem',fontFamily:isHero?"'Cormorant Garamond',serif":'inherit'}}>{rec.title}</span>
+                                    <span style={{background:`${cfg.color}20`,color:cfg.color,padding:'0.12rem 0.6rem',borderRadius:100,fontSize:'0.62rem',fontFamily:'Space Mono,monospace'}}>{cfg.label}</span>
+                                  </div>
+                                  <p style={{color:G.muted,fontSize:'0.8rem',lineHeight:1.6,margin:0}}>{rec.reason}</p>
+                                </div>
+                                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.82rem',color:G.purpleLight,fontWeight:700,flexShrink:0}}>{rec.matchScore}%</div>
+                              </div>
+                              <button onClick={()=>handleBuyClick(rec)} style={{display:'inline-flex',alignItems:'center',gap:'0.4rem',marginTop:'0.75rem',marginLeft:isHero?0:'2.5rem',color:G.cyan,fontSize:'0.76rem',background:'none',border:'none',cursor:'pointer',fontFamily:'inherit',padding:0}}>
+                                🛒 {rec.type==='book' ? 'Find it on Bookshop' : 'Find it on Amazon'}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                });
+              })()}
               {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length === 0 && (
                 <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
                   <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🌱</div>
@@ -1905,12 +2125,12 @@ Return ONLY a JSON object, no markdown, no backticks:
                 </div>
               )}
               {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length > 0 && (
-                <div style={{marginBottom:'1.25rem'}}>
-                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.75rem'}}>
-                    <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.65rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em'}}>Beyond Your Taste Network</div>
-                    <div style={{flex:1,height:1,background:G.border}}/>
+                <div style={{margin:'0.5rem 0 1.25rem',border:'1.5px dashed #33333f',borderRadius:18,background:'rgba(255,255,255,0.012)',padding:'1.1rem'}}>
+                  <div style={{display:'flex',alignItems:'center',gap:'0.5rem',marginBottom:'0.6rem'}}>
+                    <span style={{display:'inline-flex',width:20,height:20,borderRadius:5,border:'1px dashed #4a4a58',alignItems:'center',justifyContent:'center',fontFamily:'Space Mono,monospace',fontSize:'0.55rem',color:'#6b6f86'}}>AI</span>
+                    <span style={{fontFamily:'Space Mono,monospace',fontSize:'0.68rem',fontWeight:700,letterSpacing:'0.1em',color:'#6b6f86'}}>BEYOND YOUR TASTE NETWORK</span>
                   </div>
-                  <p style={{color:G.dim,fontSize:'0.72rem',lineHeight:1.5,marginBottom:'0.75rem'}}>No human taste-twin matches yet, so these are AI-generated guesses based only on your own ratings — lower trust than picks above this line.</p>
+                  <p style={{color:'#6b6f86',fontSize:'0.75rem',lineHeight:1.5,marginBottom:'0.75rem'}}>No human taste-twin matches yet, so these are AI-generated guesses based only on your own ratings — lower trust than picks above this line.</p>
                   <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
                     {aiFallbackRecs.map((rec,i)=>{
                       const cfg=typeMap[rec.type]||typeMap.film;

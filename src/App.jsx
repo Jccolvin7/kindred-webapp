@@ -754,6 +754,14 @@ export default function KindredApp() {
   const [pendingAuthUser, setPendingAuthUser] = useState(null);
 
   const [ratings, setRatings] = useState({film:{},games:{},books:{}});
+  // Separate from `ratings` (which stays title-keyed, exactly as every
+  // other consumer in this file — passport radar, archetype, recs engine —
+  // already expects). This map exists ONLY to fix the search-result star
+  // display bug: two different real things can share a title (e.g.
+  // "Foundation" the 2021 show vs the 1984 series), so title alone can't
+  // tell search-result cards apart. Keyed by `${domain}:${sourceId}`,
+  // populated whenever a rating is saved with a real source_id available.
+  const [sourceIdRatings, setSourceIdRatings] = useState({});
   const [quizDomain, setQuizDomain] = useState('film');
   const [searchQuery, setSearchQuery] = useState({film:'',games:'',books:''});
   const [searchResults, setSearchResults] = useState({film:[],games:[],books:[]});
@@ -831,11 +839,16 @@ export default function KindredApp() {
         setDiscordLinked(!!row.discord_id);
         setDataSharingConsent(!!row.data_sharing_consent);
         setConsentPrompted(!!row.data_sharing_consent_prompted);
-        const { data: saved } = await supabase.from('tastes').select('category, item_name, rating').eq('user_id', row.id);
+        const { data: saved } = await supabase.from('tastes').select('category, item_name, rating, source_id').eq('user_id', row.id);
         if (saved && saved.length) {
           const loaded = { film:{}, games:{}, books:{} };
-          saved.forEach(t => { if (loaded[t.category]) loaded[t.category][t.item_name] = t.rating; });
+          const loadedBySourceId = {};
+          saved.forEach(t => {
+            if (loaded[t.category]) loaded[t.category][t.item_name] = t.rating;
+            if (t.source_id) loadedBySourceId[`${t.category}:${t.source_id}`] = t.rating;
+          });
           setRatings(loaded);
+          setSourceIdRatings(loadedBySourceId);
         }
         touchLastActive(row.id);
         setStep('quiz');
@@ -1024,10 +1037,21 @@ export default function KindredApp() {
   }
 
   // RATING — title is used as item_name key
-  async function setRating(domain, title, val) {
+  // sourceId is optional — only the search-results screen has one (from the
+  // TMDB/RAWG/Open Library response). Manual entries, imports, and any
+  // other caller can omit it and behave exactly as before. When present,
+  // it's stored on the tastes row (new source_id column) and also tracked
+  // in sourceIdRatings, which is what actually fixes the search-result
+  // display bug — see that map's declaration for why a separate map was
+  // needed rather than changing the main ratings object's key.
+  async function setRating(domain, title, val, sourceId = null) {
     const newVal = ratings[domain][title] === val ? undefined : val;
     const nextRatings = {...ratings, [domain]: {...ratings[domain], [title]: newVal}};
     setRatings(nextRatings);
+    if (sourceId) {
+      const sk = `${domain}:${sourceId}`;
+      setSourceIdRatings(prev => ({ ...prev, [sk]: newVal }));
+    }
     if (!userId) return;
     if (newVal !== undefined) touchLastActive(userId);
     try {
@@ -1040,9 +1064,9 @@ export default function KindredApp() {
         .from('tastes').select('id')
         .eq('user_id', userId).eq('category', domain).eq('item_name', title).maybeSingle();
       if (existing) {
-        await supabase.from('tastes').update({ rating: newVal }).eq('id', existing.id);
+        await supabase.from('tastes').update({ rating: newVal, source_id: sourceId }).eq('id', existing.id);
       } else {
-        await supabase.from('tastes').insert({ user_id: userId, category: domain, item_name: title, rating: newVal });
+        await supabase.from('tastes').insert({ user_id: userId, category: domain, item_name: title, rating: newVal, source_id: sourceId });
       }
       // Keep the archetype on file fresh so Tier 3 (archetype trending) has
       // accurate data for this user going forward. Fire-and-forget.
@@ -1541,11 +1565,22 @@ Return ONLY a JSON object, no markdown, no backticks:
           {results.length > 0 && (
             <div style={{display:'flex',flexDirection:'column',gap:'0.5rem',marginBottom:'1.25rem'}}>
               {results.map((item, idx) => {
-                const userRating = currentRatings[item.title] || 0;
-                const hk = `${quizDomain}:${item.title}`;
+                // Real fix for the search-results star bug: results were
+                // keyed by item.title alone, so two different real things
+                // that happen to share a title (e.g. "Foundation" the 2021
+                // show vs "Foundation" the 1984 series) would show/share
+                // the same filled-in rating even though only one had
+                // actually been rated. When this result has a real
+                // sourceId, check sourceIdRatings (keyed per actual thing,
+                // not title) instead of the title-keyed ratings object.
+                // Falls back to title-only for results without one (older
+                // endpoints, or a source that doesn't expose a stable id).
+                const sk = item.sourceId ? `${quizDomain}:${item.sourceId}` : null;
+                const userRating = (sk && sourceIdRatings[sk] !== undefined) ? sourceIdRatings[sk] : (currentRatings[item.title] || 0);
+                const hk = item.sourceId ? `${quizDomain}:${item.sourceId}` : `${quizDomain}:${item.title}`;
                 const hovered = hoveredStar[hk] || 0;
                 return (
-                  <div key={idx} className="k-result" style={{
+                  <div key={item.sourceId || idx} className="k-result" style={{
                     background:G.card,border:`1px solid ${userRating?domInfo.color+'44':G.border}`,
                     borderRadius:12,padding:'0.75rem 1rem',display:'flex',alignItems:'center',gap:'0.875rem',
                     transition:'all 0.2s',cursor:'default'
@@ -1564,7 +1599,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                         const filled = hovered>0 ? star<=hovered : star<=userRating;
                         return (
                           <button key={star} className="k-star"
-                            onClick={()=>setRating(quizDomain,item.title,star)}
+                            onClick={()=>setRating(quizDomain,item.title,star,item.sourceId)}
                             onMouseEnter={()=>setHoveredStar(h=>({...h,[hk]:star}))}
                             onMouseLeave={()=>setHoveredStar(h=>({...h,[hk]:0}))}
                             style={{background:'none',border:'none',cursor:'pointer',fontSize:'1rem',padding:'0.1rem',

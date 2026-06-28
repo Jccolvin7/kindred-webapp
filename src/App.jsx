@@ -232,9 +232,9 @@ function computeRarityWeights(allTastes) {
 function buildWhyText(twin) {
   if (!twin.shared || twin.shared.length === 0) return null;
   const top = twin.shared.slice(0, 3).map(s => s.title);
-  if (top.length === 1) return `Matched mostly on ${top[0]} — not many people have rated that one.`;
+  if (top.length === 1) return `Matched mostly on ${top[0]}. Not many people have rated that one.`;
   const last = top.pop();
-  return `Matched mostly on ${top.join(', ')} and ${last} — rare picks that few others share.`;
+  return `Matched mostly on ${top.join(', ')} and ${last}. Rare picks that few others share.`;
 }
 
 // ─── TASTE PASSPORT RADAR (real data, no mood axis) ────────────
@@ -540,6 +540,31 @@ function PassportRadar({ axes, size = 280 }) {
 // _makeSim/_draw logic (identical across every .dc.html file). Reusable
 // behind any card/hero surface. color is an "r,g,b" string per the design
 // tokens (purple 108,93,211 / pink 255,104,157 / cyan 0,212,255).
+// One-time data-sharing consent modal. Shown exactly once, at first-twin-
+// unlock (see answerConsentPrompt's call site). Equal visual weight on
+// both buttons, no pre-selected default, no dark patterns — per the
+// handoff's explicit instruction. Copy is the finalized text, no em dashes.
+function ConsentModal({ onAnswer }) {
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(8,8,12,0.78)',backdropFilter:'blur(4px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:'1.5rem'}}>
+      <div style={{maxWidth:420,width:'100%',background:G.deep,border:`1px solid ${G.border}`,borderRadius:20,padding:'1.75rem 1.5rem'}}>
+        <h3 style={{fontFamily:"'Cormorant Garamond',serif",fontWeight:500,fontSize:'1.4rem',color:G.text,marginBottom:'0.85rem'}}>Help make Kindred smarter?</h3>
+        <p style={{color:G.muted,fontSize:'0.88rem',lineHeight:1.65,marginBottom:'1.5rem'}}>
+          When you opt in, your taste data (anonymized, never your name or identity) helps us improve recommendations and build better tools for taste discovery. You can turn this off anytime in Settings.
+        </p>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.75rem'}}>
+          <button onClick={()=>onAnswer(false)} style={{background:G.card,border:`1px solid ${G.border}`,color:G.text,padding:'0.75rem',borderRadius:12,fontSize:'0.85rem',fontWeight:500,cursor:'pointer',fontFamily:'Inter,sans-serif'}}>
+            No thanks
+          </button>
+          <button onClick={()=>onAnswer(true)} style={{background:G.card,border:`1px solid ${G.border}`,color:G.text,padding:'0.75rem',borderRadius:12,fontSize:'0.85rem',fontWeight:500,cursor:'pointer',fontFamily:'Inter,sans-serif'}}>
+            Yes, help improve Kindred
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500 }) {
   const canvasRef = useRef(null);
   useEffect(() => {
@@ -760,6 +785,15 @@ export default function KindredApp() {
   const [linkCode, setLinkCode] = useState(null);
   const [linkCodeLoading, setLinkCodeLoading] = useState(false);
   const [discordLinked, setDiscordLinked] = useState(false);
+  // Data-sharing consent state. consentPrompted gates whether the one-time
+  // opt-in modal shows at all (per the handoff: ask once, never re-prompt
+  // regardless of answer). dataSharingConsent is the actual current value,
+  // shown/editable later in Settings.
+  const [dataSharingConsent, setDataSharingConsent] = useState(false);
+  const [consentPrompted, setConsentPrompted] = useState(true); // default true so it never flashes before real data loads
+  const [showConsentModal, setShowConsentModal] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [deleteLoading, setDeleteLoading] = useState(false);
 
   const [recs, setRecs] = useState(null);
   const [aiFallbackRecs, setAiFallbackRecs] = useState([]);
@@ -795,6 +829,8 @@ export default function KindredApp() {
         setEmail(row.email || authUser.email);
         setUsername(row.username || '');
         setDiscordLinked(!!row.discord_id);
+        setDataSharingConsent(!!row.data_sharing_consent);
+        setConsentPrompted(!!row.data_sharing_consent_prompted);
         const { data: saved } = await supabase.from('tastes').select('category, item_name, rating').eq('user_id', row.id);
         if (saved && saved.length) {
           const loaded = { film:{}, games:{}, books:{} };
@@ -910,6 +946,34 @@ export default function KindredApp() {
   // actual merge has to happen bot-side. This function only ever writes to
   // the signed-in user's OWN row, which the existing users_update_own
   // policy already allows.
+  // Handles the one-time opt-in modal's answer (yes or no — both call this,
+  // just with a different value). Marks the prompt as answered so it never
+  // shows again, regardless of which button was pressed.
+  async function answerConsentPrompt(consent) {
+    setShowConsentModal(false);
+    setDataSharingConsent(consent);
+    setConsentPrompted(true);
+    try {
+      await supabase.from('users').update({
+        data_sharing_consent: consent,
+        data_sharing_consent_prompted: true,
+      }).eq('id', userId);
+      if (consent) logEvent(userId, 'data_sharing_consent_given');
+    } catch (e) { /* non-critical — worst case the prompt could resurface once */ }
+  }
+
+  // Settings toggle uses this instead — same column, different event type
+  // (consent_changed, not consent_given) since the handoff wants the two
+  // tracked separately: one for the initial decision, one for anyone who
+  // later flips it either direction.
+  async function toggleDataSharingConsent(consent) {
+    setDataSharingConsent(consent);
+    try {
+      await supabase.from('users').update({ data_sharing_consent: consent }).eq('id', userId);
+      logEvent(userId, 'data_sharing_consent_changed', consent ? 'on' : 'off');
+    } catch (e) { setAuthError('Could not update that setting. Try again.'); }
+  }
+
   async function generateLinkCode() {
     setLinkCodeLoading(true);
     try {
@@ -924,6 +988,29 @@ export default function KindredApp() {
       setAuthError('Could not generate a link code. Try again.');
     }
     setLinkCodeLoading(false);
+  }
+
+  // Account deletion. Confirmed via direct database check that NO foreign
+  // key constraints exist between tastes/matches/events and users — so
+  // there's no automatic cascade, and rows must be explicitly deleted in
+  // this order (children first, users last) or they'd be left orphaned.
+  // matches has both user_id_1 and user_id_2, so both sides need clearing.
+  async function deleteAccount() {
+    setDeleteLoading(true);
+    try {
+      await supabase.from('tastes').delete().eq('user_id', userId);
+      await supabase.from('events').delete().eq('user_id', userId);
+      await supabase.from('matches').delete().eq('user_id_1', userId);
+      await supabase.from('matches').delete().eq('user_id_2', userId);
+      await supabase.from('users').delete().eq('id', userId);
+      await supabase.auth.signOut();
+      setUserId(null);
+      setRatings({ film:{}, games:{}, books:{} });
+      setStep('welcome');
+    } catch (e) {
+      setAuthError('Could not delete your account. Try again or contact support.');
+      setDeleteLoading(false);
+    }
   }
 
   async function handleSignOut() {
@@ -1081,7 +1168,14 @@ export default function KindredApp() {
         top.forEach(c => { c.handle = nameMap[c.id] ? `@${nameMap[c.id]}` : `@user`; });
       }
       setRealTwins(top);
-      if (top.length > 0) logEventOnce(userId, 'first_match_unlocked', `${top[0].overall}%`);
+      if (top.length > 0) {
+        logEventOnce(userId, 'first_match_unlocked', `${top[0].overall}%`);
+        // Per the handoff: ask once, exactly at this moment (first twin
+        // unlock, not signup, not the home screen) — when trust is
+        // highest because the product just worked. consentPrompted being
+        // false means this account has genuinely never seen the prompt.
+        if (!consentPrompted) setShowConsentModal(true);
+      }
     } catch (e) {
       setTwinsError('Could not load taste twins. Check your connection and try again.');
     }
@@ -1108,7 +1202,7 @@ export default function KindredApp() {
       const blob = await captureCardToBlob(<PassportShareCard archetype={archetype} level={level} total={total} />);
       const ok = await shareOrDownloadBlob(
         blob, 'kindred-taste-passport.png', 'My Kindred Taste Passport',
-        `${archetypeLabel} — find your own taste twin at kindredmatch.co`,
+        `${archetypeLabel}. Find your own taste twin at kindredmatch.co`,
       );
       if (ok) { setCopiedId('passport'); setTimeout(() => setCopiedId(null), 2500); }
     } catch (e) { console.error('Share failed', e); }
@@ -1121,7 +1215,7 @@ export default function KindredApp() {
       const blob = await captureCardToBlob(<TwinShareCard twin={twin} />);
       const ok = await shareOrDownloadBlob(
         blob, 'kindred-taste-twin.png', 'My Kindred Taste Twin Match',
-        `${twin.overall}% match with ${twin.handle} — find your own taste twin at kindredmatch.co`,
+        `${twin.overall}% match with ${twin.handle}. Find your own taste twin at kindredmatch.co`,
       );
       if (ok) { setCopiedId(twin.id); setTimeout(() => setCopiedId(null), 2500); }
     } catch (e) { console.error('Share failed', e); }
@@ -1211,7 +1305,7 @@ export default function KindredApp() {
           matchScore = Math.round(item.avgRating * 20); // 1-5 stars -> 20-100 scale, rough but consistent
           tierLabel = 'Trending In Your Archetype';
         } else {
-          reason = `Trending across all of Kindred — ${item.count} people rated it ${item.avgRating.toFixed(1)}★ on average`;
+          reason = `Trending across all of Kindred. ${item.count} people rated it ${item.avgRating.toFixed(1)}★ on average`;
           matchScore = Math.round(item.avgRating * 20);
           tierLabel = 'Kindred Trending';
         }
@@ -1320,7 +1414,7 @@ Return ONLY a JSON object, no markdown, no backticks:
         </div>
         <h1 style={s.h1}>Find your<br/><em style={{color:G.purple,fontStyle:'italic'}}>taste twin.</em></h1>
         <p style={{color:G.muted,lineHeight:1.75,fontSize:'1rem',maxWidth:460,margin:'0 auto 2.25rem'}}>
-          Someone who actually gets your taste in movies, shows, books, and games. Get recommendations from them — not an algorithm.
+          Someone who actually gets your taste in movies, shows, books, and games. Get recommendations from them, not an algorithm.
         </p>
 
         {linkSent ? (
@@ -1340,9 +1434,17 @@ Return ONLY a JSON object, no markdown, no backticks:
               onClick={requestMagicLink} disabled={authLoading}>
               {authLoading ? 'Sending...' : 'Send me a sign-in link →'}
             </button>
+            <p style={{color:G.dim,fontSize:'0.7rem',marginTop:'0.75rem',lineHeight:1.5}}>
+              By signing up, you agree to our <button onClick={()=>setStep('terms')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.7rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0}}>Terms</button> and <button onClick={()=>setStep('privacy')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.7rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0}}>Privacy Policy</button>.
+            </p>
           </div>
         )}
         <p style={{color:G.dim,fontSize:'0.76rem',marginTop:'1rem'}}>No password needed. We'll email you a one-click link.</p>
+        <p style={{color:G.dim,fontSize:'0.68rem',marginTop:'1.5rem'}}>
+          <button onClick={()=>setStep('privacy')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.68rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0,marginRight:'0.75rem'}}>Privacy</button>
+          <button onClick={()=>setStep('terms')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.68rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0,marginRight:'0.75rem'}}>Terms</button>
+          <a href="mailto:info@kindredmatch.co" style={{color:G.dim,fontSize:'0.68rem',textDecoration:'underline'}}>Contact</a>
+        </p>
       </div>
     </div>
   );
@@ -1357,7 +1459,7 @@ Return ONLY a JSON object, no markdown, no backticks:
         <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'2rem',fontWeight:500,marginBottom:'2rem',letterSpacing:'0.06em'}}>
           Kind<span style={{color:G.purple}}>r</span>ed
         </div>
-        <h2 style={s.h2}>You're verified — almost there</h2>
+        <h2 style={s.h2}>You're verified, almost there</h2>
         <p style={{color:G.muted,lineHeight:1.7,fontSize:'0.95rem',maxWidth:420,margin:'0 auto 2rem'}}>One last thing before we build your taste profile.</p>
         <div style={{maxWidth:340,width:'100%'}}>
           <input className="k-input" style={s.input} type="text" placeholder="Display name (optional)"
@@ -1565,7 +1667,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                 <ol style={{color:G.muted,fontSize:'0.82rem',lineHeight:1.8,paddingLeft:'1.2rem',margin:0}}>
                   <li>On Letterboxd, hover your username (top right) → <strong style={{color:G.text}}>Settings</strong></li>
                   <li>Click the <strong style={{color:G.text}}>Data</strong> tab</li>
-                  <li>Click <strong style={{color:G.text}}>Export Your Data</strong> — a ZIP file downloads</li>
+                  <li>Click <strong style={{color:G.text}}>Export Your Data</strong>, a ZIP file downloads</li>
                   <li>Unzip it, then upload <strong style={{color:G.text}}>ratings.csv</strong> (or <strong style={{color:G.text}}>diary.csv</strong> if you don't have ratings.csv) below</li>
                 </ol>
               </div>
@@ -1630,7 +1732,7 @@ Return ONLY a JSON object, no markdown, no backticks:
               <div style={{...s.card,marginBottom:'1.25rem'}}>
                 <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.75rem'}}>Before you start</div>
                 <p style={{color:G.muted,fontSize:'0.82rem',lineHeight:1.7,margin:0}}>
-                  Steam has no star ratings — only playtime. Your Steam profile and game list also need to be set to <strong style={{color:G.text}}>Public</strong> (Steam → Settings → Privacy Settings), or we won't be able to see your library at all.
+                  Steam has no star ratings, only playtime. Your Steam profile and game list also need to be set to <strong style={{color:G.text}}>Public</strong> (Steam → Settings → Privacy Settings), or we won't be able to see your library at all.
                 </p>
               </div>
               {!steamGames && (
@@ -1717,7 +1819,7 @@ Return ONLY a JSON object, no markdown, no backticks:
             <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
               <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>✅</div>
               <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Imported {importStatus.imported} rating{importStatus.imported===1?'':'s'}</div>
-              {importStatus.skipped>0 && <p style={{color:G.dim,fontSize:'0.78rem',marginBottom:'1rem'}}>{importStatus.skipped} skipped — already rated</p>}
+              {importStatus.skipped>0 && <p style={{color:G.dim,fontSize:'0.78rem',marginBottom:'1rem'}}>{importStatus.skipped} skipped (already rated)</p>}
               <div style={{display:'flex',gap:'0.75rem'}}>
                 <button className="k-out" style={{...s.outBtn,transition:'all 0.2s'}} onClick={()=>{setImportPreview(null);setImportStatus(null);setSteamGames(null);setSteamInput('');setSteamManualRatings({});}}>Import More</button>
                 <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('profile')}>See My Passport →</button>
@@ -1890,7 +1992,51 @@ Return ONLY a JSON object, no markdown, no backticks:
               </>
             )}
           </div>
+
+          {/* Data sharing — same toggle the one-time prompt sets, editable
+              anytime per the handoff's requirement. */}
+          <div style={{...s.card,marginBottom:'1rem'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.3rem'}}>Data Sharing</div>
+                <p style={{color:G.muted,fontSize:'0.78rem',margin:0,maxWidth:240}}>Help improve recommendations with anonymized taste data.</p>
+              </div>
+              <button onClick={()=>toggleDataSharingConsent(!dataSharingConsent)} style={{flexShrink:0,width:44,height:26,borderRadius:13,border:'none',cursor:'pointer',background:dataSharingConsent?G.purple:G.border,position:'relative',transition:'background 0.2s'}}>
+                <span style={{position:'absolute',top:3,left:dataSharingConsent?22:3,width:20,height:20,borderRadius:'50%',background:'#fff',transition:'left 0.2s'}}/>
+              </button>
+            </div>
+          </div>
+
+          {/* Support + account deletion — grouped as the two "control your
+              data" actions, per the handoff's placement instruction. */}
+          <div style={{...s.card,marginBottom:'1rem'}}>
+            <a href="mailto:info@kindredmatch.co" style={{display:'block',color:G.muted,fontSize:'0.82rem',textDecoration:'none',marginBottom:'0.85rem'}}>
+              Contact / Get Help
+            </a>
+            <div style={{height:1,background:G.border,marginBottom:'0.85rem'}}/>
+            {showDeleteConfirm ? (
+              <div>
+                <p style={{color:'#FCA5A5',fontSize:'0.8rem',lineHeight:1.6,marginBottom:'0.85rem'}}>This permanently deletes your account and all your ratings. This can't be undone.</p>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'0.6rem'}}>
+                  <button onClick={()=>setShowDeleteConfirm(false)} style={{background:'transparent',border:`1px solid ${G.border}`,color:G.text,padding:'0.6rem',borderRadius:10,fontSize:'0.8rem',cursor:'pointer',fontFamily:'inherit'}}>Cancel</button>
+                  <button onClick={deleteAccount} disabled={deleteLoading} style={{background:'#7a1f1f',border:'none',color:'#fff',padding:'0.6rem',borderRadius:10,fontSize:'0.8rem',cursor:deleteLoading?'default':'pointer',fontFamily:'inherit',opacity:deleteLoading?0.6:1}}>
+                    {deleteLoading ? 'Deleting…' : 'Yes, delete'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={()=>setShowDeleteConfirm(true)} style={{background:'none',border:'none',color:'#d97a7a',fontSize:'0.8rem',cursor:'pointer',fontFamily:'inherit',padding:0}}>
+                Delete my account
+              </button>
+            )}
+          </div>
+
           <button onClick={handleSignOut} style={{background:'none',border:'none',color:G.dim,fontSize:'0.74rem',cursor:'pointer',fontFamily:'inherit',width:'100%',textAlign:'center',padding:'0.5rem'}}>Sign out</button>
+          <p style={{color:G.dim,fontSize:'0.68rem',marginTop:'1.5rem',textAlign:'center'}}>
+            <button onClick={()=>setStep('privacy')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.68rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0,marginRight:'0.75rem'}}>Privacy</button>
+            <button onClick={()=>setStep('terms')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.68rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0,marginRight:'0.75rem'}}>Terms</button>
+            <a href="mailto:info@kindredmatch.co" style={{color:G.dim,fontSize:'0.68rem',textDecoration:'underline'}}>Contact</a>
+          </p>
         </div>
       </div>
     );
@@ -1926,6 +2072,7 @@ Return ONLY a JSON object, no markdown, no backticks:
     return (
       <div style={s.app}>
         <style>{FONTS+css}</style>
+        {showConsentModal && <ConsentModal onAnswer={answerConsentPrompt} />}
         <div style={{maxWidth:600,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
           <div style={{textAlign:'center',marginBottom:'2rem'}}>
             <div style={{...s.eyebrow,color:G.cyan}}>TASTE MATCHING</div>
@@ -1948,7 +2095,7 @@ Return ONLY a JSON object, no markdown, no backticks:
             <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
               <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🔍</div>
               <div style={{fontWeight:500,marginBottom:'0.5rem'}}>No taste twins yet</div>
-              <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody else has rated the same titles as you yet. Share Kindred with friends — the more people who rate, the better the matches.</p>
+              <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody else has rated the same titles as you yet. Share Kindred with friends, since the more people who rate, the better the matches.</p>
             </div>
           )}
           {!twinsLoading && realTwins && realTwins.length > 0 && (
@@ -2030,7 +2177,7 @@ Return ONLY a JSON object, no markdown, no backticks:
     }
     const hasRealRecs = recs && recs.length > 0;
     const headerSub = hasRealRecs
-      ? 'Ranked by how much we trust the source — real taste twins first.'
+      ? 'Ranked by how much we trust the source. Real taste twins first.'
       : "Based on everything you've rated across all domains.";
 
     const CrownIcon = ({ size = 20 }) => (
@@ -2121,7 +2268,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                 <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
                   <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🌱</div>
                   <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Your taste network is still growing</div>
-                  <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody with overlapping taste has rated enough yet. Rate a few more things or share Kindred with friends — real recs come from real people here.</p>
+                  <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody with overlapping taste has rated enough yet. Rate a few more things or share Kindred with friends, since real recs come from real people here.</p>
                 </div>
               )}
               {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length > 0 && (
@@ -2130,7 +2277,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                     <span style={{display:'inline-flex',width:20,height:20,borderRadius:5,border:'1px dashed #4a4a58',alignItems:'center',justifyContent:'center',fontFamily:'Space Mono,monospace',fontSize:'0.55rem',color:'#6b6f86'}}>AI</span>
                     <span style={{fontFamily:'Space Mono,monospace',fontSize:'0.68rem',fontWeight:700,letterSpacing:'0.1em',color:'#6b6f86'}}>BEYOND YOUR TASTE NETWORK</span>
                   </div>
-                  <p style={{color:'#6b6f86',fontSize:'0.75rem',lineHeight:1.5,marginBottom:'0.75rem'}}>No human taste-twin matches yet, so these are AI-generated guesses based only on your own ratings — lower trust than picks above this line.</p>
+                  <p style={{color:'#6b6f86',fontSize:'0.75rem',lineHeight:1.5,marginBottom:'0.75rem'}}>No human taste-twin matches yet, so these are AI-generated guesses based only on your own ratings. Lower trust than picks above this line.</p>
                   <div style={{display:'flex',flexDirection:'column',gap:'0.75rem'}}>
                     {aiFallbackRecs.map((rec,i)=>{
                       const cfg=typeMap[rec.type]||typeMap.film;
@@ -2164,6 +2311,65 @@ Return ONLY a JSON object, no markdown, no backticks:
                 <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>{setRecs(null);setAiFallbackRecs([]);generateRecs();}}>Refresh Recs ↺</button>
               </div>
             </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (step === 'privacy' || step === 'terms') {
+    const isPrivacy = step === 'privacy';
+    return (
+      <div style={s.app}>
+        <style>{FONTS+css}</style>
+        <div style={{maxWidth:640,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
+          <button onClick={()=>setStep(userId ? 'profile' : 'welcome')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.8rem',cursor:'pointer',fontFamily:'inherit',marginBottom:'1.5rem',padding:0}}>← Back</button>
+          <h2 style={s.h2}>{isPrivacy ? 'Privacy Policy' : 'Terms of Service'}</h2>
+          <p style={{color:G.dim,fontSize:'0.74rem',marginBottom:'2rem'}}>Last updated: June 28, 2026</p>
+
+          {isPrivacy ? (
+            <div style={{color:G.muted,fontSize:'0.88rem',lineHeight:1.75}}>
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>What we collect</h3>
+              <p>When you use Kindred, we collect your email address (for sign-in via magic link, no password), the titles you rate and your star rating for each, basic usage activity, and, if you connect a Discord account, your Discord ID, used to combine your ratings across both platforms into one profile.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>What we do with it</h3>
+              <p>We use your ratings to find your taste twins and generate recommendations based on what they loved. We use basic usage data to understand what's working and improve the product. If you opt in to data sharing (a separate, optional choice you control in Settings), we may use your anonymized taste data, never your name or identity, to improve our recommendation system and to build future taste-discovery tools, which may include future Kindred products or partnerships with other companies. Opting in is never required to use Kindred, and you can turn it off anytime.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>What we don't do</h3>
+              <p>We never sell your name, email, or any way to identify you personally. We never share your individual ratings with other users by name beyond what the product already shows. We don't let any company pay to influence your taste-twin matches or recommendations. If Kindred ever shows advertising in the future, it will be clearly labeled as such and will never affect who you're matched with or what real users' ratings show you.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Third-party services we use</h3>
+              <p>Supabase (database and sign-in), Resend (magic-link emails), TMDB/RAWG/Open Library (search), Anthropic's Claude API (last-resort recommendation fallback only), and Amazon Associates / Bookshop.org (affiliate links, disclosed on the page itself).</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Your controls</h3>
+              <p>You can change your data-sharing choice anytime in Settings. You can delete your account anytime in Settings, which permanently removes your ratings, profile, and activity history. You can contact us anytime at <a href="mailto:info@kindredmatch.co" style={{color:G.cyan}}>info@kindredmatch.co</a>.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Children</h3>
+              <p>Kindred is not intended for anyone under 13. We don't knowingly collect data from children under 13.</p>
+            </div>
+          ) : (
+            <div style={{color:G.muted,fontSize:'0.88rem',lineHeight:1.75}}>
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Using Kindred</h3>
+              <p>Kindred helps you find people with similar taste in film, TV, games, and books, and get recommendations from them. You need a valid email to sign up. You're responsible for what you post being accurate and not impersonating someone else.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Acceptable use</h3>
+              <p>Don't use Kindred to harass or impersonate other users, attempt to access another user's account, scrape or republish other users' data without permission, or use automated tools to create fake accounts or ratings.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Account termination</h3>
+              <p>We can suspend or remove an account that violates these terms. You can delete your own account anytime in Settings.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>No warranty</h3>
+              <p>Kindred is provided as-is. Recommendations are based on real user taste data and, occasionally, AI, and we don't guarantee you'll love everything suggested.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Affiliate disclosure</h3>
+              <p>Some links on Kindred (to Amazon or Bookshop.org) are affiliate links. We may earn a small commission if you make a purchase through them, at no extra cost to you.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Future advertising</h3>
+              <p>Kindred does not currently show ads. If that changes in the future, any advertising will be clearly labeled, will never affect taste-twin matches or recommendations, and this policy will be updated to reflect it before it happens.</p>
+
+              <h3 style={{color:G.text,fontSize:'1rem',marginTop:'1.5rem',marginBottom:'0.5rem'}}>Contact</h3>
+              <p>Questions about these terms: <a href="mailto:info@kindredmatch.co" style={{color:G.cyan}}>info@kindredmatch.co</a>.</p>
+            </div>
           )}
         </div>
       </div>

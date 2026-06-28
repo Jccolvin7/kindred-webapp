@@ -828,6 +828,13 @@ export default function KindredApp() {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteLoading, setDeleteLoading] = useState(false);
 
+  // "Your twin changed" notifications (V1: #1 Taste Neighbor rated
+  // something new). showNotifInbox toggles the dropdown/panel open;
+  // notifications holds the fetched list (null = not loaded yet, so the
+  // bell can stay hidden until we actually know there's nothing to show).
+  const [notifications, setNotifications] = useState(null);
+  const [showNotifInbox, setShowNotifInbox] = useState(false);
+
   const [recs, setRecs] = useState(null);
   const [aiFallbackRecs, setAiFallbackRecs] = useState([]);
   const [recError, setRecError] = useState(null);
@@ -891,6 +898,18 @@ export default function KindredApp() {
     return () => { active = false; listener.subscription.unsubscribe(); };
   }, []);
 
+  // "Your twin changed" notifications — fetch once on login, then a light
+  // poll every 2 minutes while signed in. No realtime subscription for V1
+  // (would need a Supabase Realtime channel, more infra than this scope
+  // needs); a 2-minute poll is cheap and plenty responsive for a feature
+  // whose entire point is "something changed since you last looked".
+  useEffect(() => {
+    if (!userId) return;
+    fetchNotifications();
+    const iv = setInterval(fetchNotifications, 120000);
+    return () => clearInterval(iv);
+  }, [userId]);
+
   // SEARCH — debounced, fires 400ms after user stops typing
   useEffect(() => {
     const domain = quizDomain;
@@ -937,6 +956,41 @@ export default function KindredApp() {
   }
   async function touchLastActive(uid) {
     try { await supabase.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', uid); } catch (e) {}
+  }
+
+  // "Your twin changed" V1 inbox. This is a plain SELECT of the user's own
+  // notifications, no service-role endpoint needed here — reading your own
+  // rows is exactly what the normal self-only RLS policy already allows.
+  // Only the cross-user WRITE (in /api/notify-twins) needed the workaround.
+  async function fetchNotifications() {
+    if (!userId) return;
+    try {
+      const { data, error } = await supabase
+        .from('notifications')
+        .select('id, twin_user_id, category, item_name, rating, source_id, read, created_at')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      if (error) throw error;
+      if (!data || data.length === 0) { setNotifications([]); return; }
+      // Resolve twin_user_id -> username in one extra query rather than a
+      // join, since the rest of this app already fetches users separately
+      // (see fetchRealTwins' nameMap pattern) rather than relying on
+      // Supabase relational embeds.
+      const twinIds = [...new Set(data.map(n => n.twin_user_id))];
+      const { data: twinRows } = await supabase.from('users').select('id, username').in('id', twinIds);
+      const nameMap = {};
+      twinRows?.forEach(u => { nameMap[u.id] = u.username; });
+      setNotifications(data.map(n => ({ ...n, twinName: nameMap[n.twin_user_id] || 'Someone' })));
+    } catch (e) {
+      console.error('Failed to load notifications', e);
+    }
+  }
+
+  async function markNotificationsRead(ids) {
+    if (!ids.length) return;
+    setNotifications(prev => prev ? prev.map(n => ids.includes(n.id) ? { ...n, read: true } : n) : prev);
+    try { await supabase.from('notifications').update({ read: true }).in('id', ids); } catch (e) {}
   }
 
   async function requestMagicLink() {
@@ -1125,6 +1179,23 @@ export default function KindredApp() {
       // Keep the archetype on file fresh so Tier 3 (archetype trending) has
       // accurate data for this user going forward. Fire-and-forget.
       saveArchetypeForUser(userId, nextRatings);
+      // "Your twin changed" V1 — only trigger: am I anyone's #1 Taste
+      // Neighbor, and did I just rate something 4-5★ that they haven't
+      // rated yet? Routed through a serverless endpoint (not a direct
+      // Supabase call) because this writes a notification row into SOMEONE
+      // ELSE's account, which a self-only RLS policy correctly won't allow
+      // from this browser session. Fire-and-forget: a failed notification
+      // check should never block the rating the user is actually trying to
+      // save. Scoped to live ratings only (search/manual rate) — bulk
+      // import deliberately does NOT call this, to avoid one big import
+      // firing a flood of notifications at someone's twins all at once.
+      if (newVal >= 4) {
+        fetch('/api/notify-twins', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ raterId: userId, category: domain, itemName: title, rating: newVal, sourceId }),
+        }).catch(() => {});
+      }
     } catch (e) { console.error('Save failed', e); }
   }
 
@@ -1981,6 +2052,85 @@ Return ONLY a JSON object, no markdown, no backticks:
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:560,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
+
+          {/* NOTIFICATIONS BELL — "Your twin changed" V1. Sits above the
+              Passport card so it's the first thing visible on the home
+              screen, since the whole point is "something changed since you
+              last looked" — burying it below the fold defeats that. */}
+          {(() => {
+            const unread = (notifications || []).filter(n => !n.read);
+            return (
+              <div style={{position:'relative',marginBottom:'0.85rem'}}>
+                <button
+                  onClick={() => {
+                    const next = !showNotifInbox;
+                    setShowNotifInbox(next);
+                    if (next && unread.length > 0) markNotificationsRead(unread.map(n => n.id));
+                  }}
+                  style={{
+                    display:'flex',alignItems:'center',gap:'0.5rem',background:'none',border:'none',
+                    cursor:'pointer',fontFamily:'inherit',padding:'0.3rem 0',color:unread.length?G.text:G.dim,
+                  }}
+                >
+                  <span style={{fontSize:'1.05rem'}}>🔔</span>
+                  <span style={{fontSize:'0.82rem',fontWeight:unread.length?600:400}}>
+                    {unread.length > 0 ? `${unread.length} new` : 'Notifications'}
+                  </span>
+                  {unread.length > 0 && (
+                    <span style={{width:7,height:7,borderRadius:'50%',background:G.purple,display:'inline-block'}}/>
+                  )}
+                </button>
+
+                {showNotifInbox && (
+                  <div style={{
+                    position:'absolute',top:'100%',left:0,right:0,zIndex:20,marginTop:'0.4rem',
+                    background:G.card,border:`1px solid ${G.border}`,borderRadius:14,
+                    boxShadow:'0 12px 32px rgba(0,0,0,0.45)',overflow:'hidden',maxHeight:340,overflowY:'auto',
+                  }}>
+                    {notifications === null ? (
+                      <div style={{padding:'1rem',fontSize:'0.8rem',color:G.dim}}>Loading…</div>
+                    ) : notifications.length === 0 ? (
+                      <div style={{padding:'1.1rem',fontSize:'0.8rem',color:G.dim,textAlign:'center'}}>
+                        Nothing yet. We'll let you know when your #1 Taste Neighbor rates something new.
+                      </div>
+                    ) : (
+                      notifications.map(n => {
+                        const icon = n.category === 'film' ? '🎬' : n.category === 'games' ? '🎮' : '📚';
+                        const stars = '★'.repeat(n.rating);
+                        return (
+                          <div key={n.id} style={{
+                            padding:'0.85rem 1rem',borderBottom:`1px solid ${G.border}`,
+                            background:n.read?'transparent':'rgba(139,92,246,0.06)',
+                          }}>
+                            <div style={{fontSize:'0.82rem',lineHeight:1.4}}>
+                              {icon} <strong>{n.twinName}</strong> just rated <strong>{n.item_name}</strong>{' '}
+                              <span style={{color:G.gold}}>{stars}</span>
+                            </div>
+                            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:'0.45rem'}}>
+                              <span style={{fontSize:'0.66rem',color:G.dim}}>
+                                {new Date(n.created_at).toLocaleDateString()}
+                              </span>
+                              <button
+                                onClick={() => {
+                                  setQuizDomain(n.category);
+                                  setSearchQuery(prev => ({...prev, [n.category]: n.item_name}));
+                                  setShowNotifInbox(false);
+                                  setStep('quiz');
+                                }}
+                                style={{...s.outBtn,padding:'0.3rem 0.7rem',fontSize:'0.68rem',width:'auto'}}
+                              >
+                                Find &amp; rate →
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
 
           {/* PASSPORT CARD — collectible card per Claude Design handoff */}
           <div style={{position:'relative',border:`1px solid ${G.border}`,borderRadius:24,overflow:'hidden',background:`linear-gradient(180deg, ${G.deep}, ${G.bg})`,marginBottom:'1.25rem'}}>

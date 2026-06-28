@@ -210,12 +210,26 @@ function getFreshness(totalRated) {
   return { pct: Math.round((intoCurrentBand / 5) * 100), remaining: 5 - intoCurrentBand };
 }
 
+// Single source of truth for the "category:title" key used everywhere
+// matching/rarity logic groups two ratings as "the same item" — twin
+// matching, rarity weighting, and all four rec tiers. Lowercased to match
+// the bot's matching key exactly: the bot has always lowercased here, so a
+// title that comes back from a catalog API in slightly different casing
+// across platforms (or gets free-typed by a Discord user in different
+// case) previously failed to match on web even though it matched on
+// Discord, silently undercounting otherwise-real shared favorites. This
+// can only ever surface MORE matches than before, never fewer — existing
+// matches that already worked keep working identically.
+function matchKey(category, itemName) {
+  return `${category}:${itemName.toLowerCase()}`;
+}
+
 // Rare shared titles should count more toward a match than mainstream ones.
 // Weight runs from 0.3 (almost everyone has rated it) up to 3 (almost nobody else has).
 function computeRarityWeights(allTastes) {
   const raterSets = {};
   allTastes.forEach(t => {
-    const key = `${t.category}:${t.item_name}`;
+    const key = matchKey(t.category, t.item_name);
     if (!raterSets[key]) raterSets[key] = new Set();
     raterSets[key].add(t.user_id);
   });
@@ -285,10 +299,19 @@ const RECS_TARGET = 6; // soft target per screen — tiers stop once hit, not a 
 // of the same matching math drifting apart over time.
 function buildTwinGraph(myUserId, allTastes) {
   const rarityWeights = computeRarityWeights(allTastes);
-  const mine = allTastes.filter(t => t.user_id === myUserId);
+  // Coerce both sides to string before comparing. Tier 2 (neighbor-of-
+  // neighbor) calls this recursively with twin.id, which comes from an
+  // object key (for...in) and is therefore a STRING, whereas tastes.user_id
+  // arrives from Supabase as a number. A strict === between "7" and 7 is
+  // false, so without this coercion `mine` came back empty on the recursive
+  // call, weightedSims never populated, candidates was always [], and the
+  // entire neighbor-of-neighbor tier silently produced zero recs. Top-level
+  // callers pass a numeric id, which also works fine through String().
+  const meKey = String(myUserId);
+  const mine = allTastes.filter(t => String(t.user_id) === meKey);
   const byUser = {};
   allTastes.forEach(t => {
-    if (t.user_id === myUserId) return;
+    if (String(t.user_id) === meKey) return;
     if (!byUser[t.user_id]) byUser[t.user_id] = [];
     byUser[t.user_id].push(t);
   });
@@ -298,10 +321,10 @@ function buildTwinGraph(myUserId, allTastes) {
     const theirs = byUser[otherId];
     const weightedSims = [];
     mine.forEach(m => {
-      const match = theirs.find(t => t.category === m.category && t.item_name === m.item_name);
+      const match = theirs.find(t => t.category === m.category && t.item_name.toLowerCase() === m.item_name.toLowerCase());
       if (match) {
         const sim = 1 - Math.abs(m.rating - match.rating) / 4;
-        const weight = rarityWeights[`${m.category}:${m.item_name}`] || 1;
+        const weight = rarityWeights[matchKey(m.category, m.item_name)] || 1;
         weightedSims.push({ sim, weight });
       }
     });
@@ -319,14 +342,14 @@ function buildTwinGraph(myUserId, allTastes) {
 // twins loved it. Highest-trust tier: real people, direct match.
 function buildTwinBackedRecs(myUserId, allTastes, limit = RECS_TARGET) {
   const { mine, rarityWeights, candidates } = buildTwinGraph(myUserId, allTastes);
-  const mineKeys = new Set(mine.map(t => `${t.category}:${t.item_name}`));
+  const mineKeys = new Set(mine.map(t => matchKey(t.category, t.item_name)));
   const topTwins = candidates.slice(0, 10); // consider top 10 twins, not just the top 5 shown on the Twins screen
 
   const itemMap = {};
   topTwins.forEach(twin => {
     twin.ratings.forEach(r => {
       if (r.rating < 4) return;
-      const key = `${r.category}:${r.item_name}`;
+      const key = matchKey(r.category, r.item_name);
       if (mineKeys.has(key)) return;
       if (!itemMap[key]) itemMap[key] = { category: r.category, item_name: r.item_name, twinScores: [] };
       itemMap[key].twinScores.push({ twinScore: twin.overall, rarityWeight: rarityWeights[key] || 1 });
@@ -353,17 +376,19 @@ function buildTwinBackedRecs(myUserId, allTastes, limit = RECS_TARGET) {
 // user nor their direct twins have rated. Still zero AI.
 function buildNeighborOfNeighborRecs(myUserId, allTastes, excludeKeys, limit = RECS_TARGET) {
   const { mine, rarityWeights, candidates } = buildTwinGraph(myUserId, allTastes);
-  const mineKeys = new Set(mine.map(t => `${t.category}:${t.item_name}`));
+  const mineKeys = new Set(mine.map(t => matchKey(t.category, t.item_name)));
   const directTwins = candidates.slice(0, 10);
   const directTwinIds = new Set(directTwins.map(t => t.id));
   const directTwinItemKeys = new Set();
-  directTwins.forEach(t => t.ratings.forEach(r => directTwinItemKeys.add(`${r.category}:${r.item_name}`)));
+  directTwins.forEach(t => t.ratings.forEach(r => directTwinItemKeys.add(matchKey(r.category, r.item_name))));
 
   const secondDegree = {}; // userId -> { score, ratings }, deduped across direct twins
+  const meKey = String(myUserId);
   directTwins.forEach(twin => {
     const { candidates: theirTwins } = buildTwinGraph(twin.id, allTastes);
     theirTwins.slice(0, 5).forEach(t2 => {
-      if (t2.id === myUserId || directTwinIds.has(t2.id)) return;
+      // String-coerce: t2.id is an object-key string, myUserId is numeric.
+      if (String(t2.id) === meKey || directTwinIds.has(t2.id)) return;
       if (!secondDegree[t2.id]) secondDegree[t2.id] = { score: t2.overall, ratings: t2.ratings };
     });
   });
@@ -372,7 +397,7 @@ function buildNeighborOfNeighborRecs(myUserId, allTastes, excludeKeys, limit = R
   Object.values(secondDegree).forEach(({ score, ratings }) => {
     ratings.forEach(r => {
       if (r.rating < 4) return;
-      const key = `${r.category}:${r.item_name}`;
+      const key = matchKey(r.category, r.item_name);
       if (mineKeys.has(key) || directTwinItemKeys.has(key) || excludeKeys.has(key)) return;
       if (!itemMap[key]) itemMap[key] = { category: r.category, item_name: r.item_name, scores: [] };
       itemMap[key].scores.push(score);
@@ -382,7 +407,7 @@ function buildNeighborOfNeighborRecs(myUserId, allTastes, excludeKeys, limit = R
   const scored = Object.values(itemMap).map(entry => {
     const count = entry.scores.length;
     const avgScore = entry.scores.reduce((a, b) => a + b, 0) / count;
-    const rarityWeight = rarityWeights[`${entry.category}:${entry.item_name}`] || 1;
+    const rarityWeight = rarityWeights[matchKey(entry.category, entry.item_name)] || 1;
     const rank = avgScore * rarityWeight * Math.sqrt(count);
     return { ...entry, neighborCount: count, avgScore: Math.round(avgScore), rank, tier: 2 };
   });
@@ -403,11 +428,11 @@ async function buildArchetypeTrendingRecs(myArchetype, myUserId, allTastes, excl
   const peerIds = new Set(sameArchetypeUsers.map(u => u.id).filter(id => id !== myUserId));
   if (peerIds.size === 0) return [];
 
-  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => `${t.category}:${t.item_name}`));
+  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => matchKey(t.category, t.item_name)));
   const itemMap = {};
   allTastes.forEach(t => {
     if (!peerIds.has(t.user_id) || t.rating < 4) return;
-    const key = `${t.category}:${t.item_name}`;
+    const key = matchKey(t.category, t.item_name);
     if (mineKeys.has(key) || excludeKeys.has(key)) return;
     if (!itemMap[key]) itemMap[key] = { category: t.category, item_name: t.item_name, count: 0, ratingSum: 0 };
     itemMap[key].count++;
@@ -423,11 +448,11 @@ async function buildArchetypeTrendingRecs(myArchetype, myUserId, allTastes, excl
 // for "real human data, no AI." For a very early/small user base this may
 // legitimately come back empty.
 function buildGlobalTrendingRecs(myUserId, allTastes, excludeKeys, limit = RECS_TARGET) {
-  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => `${t.category}:${t.item_name}`));
+  const mineKeys = new Set(allTastes.filter(t => t.user_id === myUserId).map(t => matchKey(t.category, t.item_name)));
   const itemMap = {};
   allTastes.forEach(t => {
     if (t.user_id === myUserId || t.rating < 4) return;
-    const key = `${t.category}:${t.item_name}`;
+    const key = matchKey(t.category, t.item_name);
     if (mineKeys.has(key) || excludeKeys.has(key)) return;
     if (!itemMap[key]) itemMap[key] = { category: t.category, item_name: t.item_name, count: 0, ratingSum: 0 };
     itemMap[key].count++;
@@ -1056,15 +1081,44 @@ export default function KindredApp() {
     if (newVal !== undefined) touchLastActive(userId);
     try {
       if (newVal === undefined) {
-        await supabase.from('tastes').delete()
-          .eq('user_id', userId).eq('category', domain).eq('item_name', title);
+        // Unrate: when this came from a search result with a real sourceId,
+        // delete that exact row by id rather than by title, for the same
+        // reason as the lookup below — deleting by title alone could hit
+        // the wrong one of two same-titled different things.
+        if (sourceId) {
+          await supabase.from('tastes').delete()
+            .eq('user_id', userId).eq('category', domain).eq('source_id', sourceId);
+        } else {
+          await supabase.from('tastes').delete()
+            .eq('user_id', userId).eq('category', domain).eq('item_name', title);
+        }
         return;
       }
-      const { data: existing } = await supabase
-        .from('tastes').select('id')
-        .eq('user_id', userId).eq('category', domain).eq('item_name', title).maybeSingle();
+      // Look up the existing row by source_id FIRST when one is available.
+      // The original lookup matched on user_id+category+item_name only,
+      // which is the deeper version of the original search-display bug:
+      // two genuinely different things that happen to share a title (e.g.
+      // two different "Foundation"s) would resolve to the same "existing"
+      // row here, so rating the second one silently overwrote the first
+      // one's rating/source_id instead of creating its own row. Falls back
+      // to the old title-only lookup for callers with no sourceId (manual
+      // entries, imports, older saved rows) so existing behavior there is
+      // unchanged.
+      let existing = null;
+      if (sourceId) {
+        const { data } = await supabase
+          .from('tastes').select('id')
+          .eq('user_id', userId).eq('category', domain).eq('source_id', sourceId).maybeSingle();
+        existing = data;
+      }
+      if (!existing) {
+        const { data } = await supabase
+          .from('tastes').select('id')
+          .eq('user_id', userId).eq('category', domain).eq('item_name', title).maybeSingle();
+        existing = data;
+      }
       if (existing) {
-        await supabase.from('tastes').update({ rating: newVal, source_id: sourceId }).eq('id', existing.id);
+        await supabase.from('tastes').update({ rating: newVal, source_id: sourceId, item_name: title }).eq('id', existing.id);
       } else {
         await supabase.from('tastes').insert({ user_id: userId, category: domain, item_name: title, rating: newVal, source_id: sourceId });
       }
@@ -1084,7 +1138,21 @@ export default function KindredApp() {
     setImportStatus({ loading: true });
     try {
       const existingTitles = new Set(Object.keys(ratings[category]).map(t => t.toLowerCase()));
-      const fresh = items.filter(i => i.title && i.rating >= 1 && !existingTitles.has(i.title.toLowerCase()));
+      // Real exports can legitimately contain the same title more than once
+      // (a re-watch logged twice in Letterboxd, a duplicate diary entry,
+      // etc.). The filter below only checked against titles already saved
+      // to the DB/state — it never protected against two rows in THIS SAME
+      // file sharing a title, so both passed through and both got inserted
+      // as separate tastes rows. Dedupe within the batch first, keeping the
+      // last occurrence (most exports list entries newest-first, so "last"
+      // in file order is usually the earliest watch/read, but either way
+      // this guarantees exactly one row per title rather than a random
+      // count depending on how many times it appeared).
+      const seenInBatch = new Map();
+      items.forEach(i => {
+        if (i.title && i.rating >= 1) seenInBatch.set(i.title.toLowerCase(), i);
+      });
+      const fresh = [...seenInBatch.values()].filter(i => !existingTitles.has(i.title.toLowerCase()));
       const rows = fresh.map(i => ({ user_id: userId, category, item_name: i.title, rating: i.rating }));
       const chunkSize = 300;
       for (let idx = 0; idx < rows.length; idx += chunkSize) {
@@ -1152,10 +1220,10 @@ export default function KindredApp() {
         const theirs = byUser[otherId];
         const weightedSims = []; // {sim, weight, category}
         mine.forEach(m => {
-          const match = theirs.find(t => t.category === m.category && t.item_name === m.item_name);
+          const match = theirs.find(t => t.category === m.category && t.item_name.toLowerCase() === m.item_name.toLowerCase());
           if (match) {
             const sim = 1 - Math.abs(m.rating - match.rating) / 4;
-            const weight = rarityWeights[`${m.category}:${m.item_name}`] || 1;
+            const weight = rarityWeights[matchKey(m.category, m.item_name)] || 1;
             weightedSims.push({ sim, weight, category: m.category });
           }
         });
@@ -1169,16 +1237,19 @@ export default function KindredApp() {
           const tw = arr.reduce((a,b)=>a+b.weight,0);
           domains[d] = Math.round((arr.reduce((a,b)=>a+b.sim*b.weight,0)/tw)*100);
         });
-        const mineMap = {}; mine.forEach(t => { mineMap[`${t.category}:${t.item_name}`] = t.rating; });
-        const theirMap = {}; theirs.forEach(t => { theirMap[`${t.category}:${t.item_name}`] = t.rating; });
-        const shared = mine.filter(t => theirMap[`${t.category}:${t.item_name}`] !== undefined && t.rating >= 4 && theirMap[`${t.category}:${t.item_name}`] >= 4)
+        // Same matchKey helper used everywhere else in the recs/twin-matching
+        // system, so "I both rated this" can't disagree with "the rarity/
+        // similarity math both rated this" over a casing difference.
+        const mineMap = {}; mine.forEach(t => { mineMap[matchKey(t.category, t.item_name)] = t.rating; });
+        const theirMap = {}; theirs.forEach(t => { theirMap[matchKey(t.category, t.item_name)] = t.rating; });
+        const shared = mine.filter(t => theirMap[matchKey(t.category, t.item_name)] !== undefined && t.rating >= 4 && theirMap[matchKey(t.category, t.item_name)] >= 4)
           .map(t => {
-            const key = `${t.category}:${t.item_name}`;
+            const key = matchKey(t.category, t.item_name);
             return { title: t.item_name, mine: t.rating, theirs: theirMap[key], weight: rarityWeights[key] || 1 };
           })
           .sort((a,b)=>b.weight-a.weight).slice(0,4);
-        const onlyMine = mine.filter(t => !theirMap[`${t.category}:${t.item_name}`] && t.rating >= 4).slice(0,3);
-        const onlyTheirs = theirs.filter(t => !mineMap[`${t.category}:${t.item_name}`] && t.rating >= 4).slice(0,3);
+        const onlyMine = mine.filter(t => !theirMap[matchKey(t.category, t.item_name)] && t.rating >= 4).slice(0,3);
+        const onlyTheirs = theirs.filter(t => !mineMap[matchKey(t.category, t.item_name)] && t.rating >= 4).slice(0,3);
         const candidate = { id: otherId, overall, domains, overlap: weightedSims.length, shared, onlyMine, onlyTheirs };
         candidate.why = buildWhyText(candidate);
         candidates.push(candidate);
@@ -1274,7 +1345,7 @@ export default function KindredApp() {
       const myArchetype = myUserRow?.archetype || null;
 
       const excludeKeys = new Set();
-      const addToExclude = (items) => items.forEach(i => excludeKeys.add(`${i.category}:${i.item_name}`));
+      const addToExclude = (items) => items.forEach(i => excludeKeys.add(matchKey(i.category, i.item_name)));
       let combined = [];
 
       // Tier 1 — twin-backed

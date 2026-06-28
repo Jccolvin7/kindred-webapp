@@ -1124,11 +1124,26 @@ export default function KindredApp() {
   // display bug — see that map's declaration for why a separate map was
   // needed rather than changing the main ratings object's key.
   async function setRating(domain, title, val, sourceId = null) {
-    const newVal = ratings[domain][title] === val ? undefined : val;
+    // FOUND while re-auditing after the two fixes above, same root cause:
+    // this toggle check decided "is the user un-rating, or setting a new
+    // value?" by comparing against the TITLE-keyed value, even when a
+    // sourceId is available. That broke rating a second same-titled item:
+    // if book A (title "X") was already rated 5*, clicking 5* on a
+    // DIFFERENT book B that also happens to be titled "X" would see the
+    // title slot already holding 5, conclude the user must be toggling OFF
+    // an existing 5* rating, and silently turn the click into an unrate
+    // (deleting nothing, since book B never had a row) instead of saving
+    // book B's first rating at all. Fixed to check the correct per-item
+    // value: sourceIdRatings for items that have a sourceId, the
+    // title-keyed value only as a fallback for items that don't.
+    const sk = sourceId ? `${domain}:${sourceId}` : null;
+    const currentForThisItem = sk
+      ? (sourceIdRatings[sk] !== undefined ? sourceIdRatings[sk] : 0)
+      : (ratings[domain][title] || 0);
+    const newVal = currentForThisItem === val ? undefined : val;
     const nextRatings = {...ratings, [domain]: {...ratings[domain], [title]: newVal}};
     setRatings(nextRatings);
     if (sourceId) {
-      const sk = `${domain}:${sourceId}`;
       setSourceIdRatings(prev => ({ ...prev, [sk]: newVal }));
     }
     if (!userId) return;
@@ -1148,24 +1163,32 @@ export default function KindredApp() {
         }
         return;
       }
-      // Look up the existing row by source_id FIRST when one is available.
-      // The original lookup matched on user_id+category+item_name only,
-      // which is the deeper version of the original search-display bug:
-      // two genuinely different things that happen to share a title (e.g.
-      // two different "Foundation"s) would resolve to the same "existing"
-      // row here, so rating the second one silently overwrote the first
-      // one's rating/source_id instead of creating its own row. Falls back
-      // to the old title-only lookup for callers with no sourceId (manual
-      // entries, imports, older saved rows) so existing behavior there is
-      // unchanged.
+      // Look up the existing row by source_id when one is available.
+      //
+      // FIXED after live testing surfaced a real data-corruption bug here:
+      // the earlier version of this lookup fell through to a title-only
+      // match whenever no row existed with the given source_id — but "no
+      // row with this source_id yet" is the NORMAL state for a brand-new
+      // item, not a sign that the title-only fallback is safe to use. That
+      // fallback could (and did) match a DIFFERENT existing row that just
+      // happened to share the exact title text (e.g. two different real
+      // "The Hunger Games" books), and then overwrite THAT row's
+      // rating/source_id with the new item's data — silently corrupting an
+      // unrelated rating, not just displaying it wrong.
+      //
+      // The fix: once a sourceId is provided, ONLY ever match on that exact
+      // source_id. No match -> this is genuinely new -> insert. The
+      // title-only fallback now applies ONLY when no sourceId was provided
+      // at all (manual entries, imports, or a catalog source that doesn't
+      // expose a stable id) — the same narrow, unavoidable case as the
+      // search-display fix.
       let existing = null;
       if (sourceId) {
         const { data } = await supabase
           .from('tastes').select('id')
           .eq('user_id', userId).eq('category', domain).eq('source_id', sourceId).maybeSingle();
         existing = data;
-      }
-      if (!existing) {
+      } else {
         const { data } = await supabase
           .from('tastes').select('id')
           .eq('user_id', userId).eq('category', domain).eq('item_name', title).maybeSingle();
@@ -1712,13 +1735,27 @@ Return ONLY a JSON object, no markdown, no backticks:
                 // that happen to share a title (e.g. "Foundation" the 2021
                 // show vs "Foundation" the 1984 series) would show/share
                 // the same filled-in rating even though only one had
-                // actually been rated. When this result has a real
-                // sourceId, check sourceIdRatings (keyed per actual thing,
-                // not title) instead of the title-keyed ratings object.
-                // Falls back to title-only for results without one (older
-                // endpoints, or a source that doesn't expose a stable id).
+                // actually been rated.
+                //
+                // IMPORTANT, fixed after live testing surfaced it: the
+                // earlier version of this check fell back to the
+                // title-keyed ratings object whenever sourceIdRatings[sk]
+                // was undefined — but "undefined" is the NORMAL state for
+                // any item that simply hasn't been rated under its own ID
+                // yet, not just for items with no ID at all. That meant
+                // rating one of two same-titled-but-different items (each
+                // with its own real, distinct sourceId from the catalog)
+                // still made the OTHER one light up, because the fallback
+                // fired for it too. The fix: once an item HAS a sourceId,
+                // ONLY ever check sourceIdRatings for that exact ID — never
+                // fall back to title. The title-only fallback now applies
+                // ONLY to results with no sourceId at all (a source that
+                // didn't expose a stable id), which is a much narrower,
+                // genuinely unavoidable edge case.
                 const sk = item.sourceId ? `${quizDomain}:${item.sourceId}` : null;
-                const userRating = (sk && sourceIdRatings[sk] !== undefined) ? sourceIdRatings[sk] : (currentRatings[item.title] || 0);
+                const userRating = sk
+                  ? (sourceIdRatings[sk] !== undefined ? sourceIdRatings[sk] : 0)
+                  : (currentRatings[item.title] || 0);
                 const hk = item.sourceId ? `${quizDomain}:${item.sourceId}` : `${quizDomain}:${item.title}`;
                 const hovered = hoveredStar[hk] || 0;
                 return (

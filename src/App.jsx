@@ -1803,8 +1803,8 @@ Return ONLY a JSON object, no markdown, no backticks:
 
   // STYLES
   const s = {
-    app:{minHeight:'100vh',background:G.bg,color:G.text,fontFamily:"'Inter',system-ui,sans-serif"},
-    center:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',padding:'2rem',textAlign:'center'},
+    app:{minHeight:'100%',background:G.bg,color:G.text,fontFamily:"'Inter',system-ui,sans-serif"},
+    center:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100%',padding:'2rem',textAlign:'center'},
     card:{background:G.card,border:`1px solid ${G.border}`,borderRadius:18,padding:'1.5rem'},
     h1:{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:'clamp(2.5rem,6vw,4.5rem)',fontWeight:300,lineHeight:1.08,marginBottom:'1rem'},
     h2:{fontFamily:"'Cormorant Garamond',Georgia,serif",fontSize:'clamp(1.75rem,4vw,2.75rem)',fontWeight:300,lineHeight:1.15,marginBottom:'0.875rem'},

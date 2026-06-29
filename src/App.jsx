@@ -590,7 +590,56 @@ function ConsentModal({ onAnswer }) {
   );
 }
 
-function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500 }) {
+// Animates a number counting up from 0 to `value` on mount. Used for the
+// twin match percentage so the reveal feels like an unlock rather than a
+// number that was just always sitting there.
+function CountUp({ value, duration = 900, suffix = '' }) {
+  const [display, setDisplay] = useState(0);
+  useEffect(() => {
+    let raf; const start = performance.now();
+    const tick = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic
+      setDisplay(Math.round(eased * value));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [value, duration]);
+  return <>{display}{suffix}</>;
+}
+
+// Line-art glyphs for empty/locked states, replacing emoji so these moments
+// match the Cormorant/constellation aesthetic rather than relying on
+// platform-inconsistent emoji rendering.
+function LockGlyph({ size = 40, color = '#8B8FA6' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="5" y="11" width="14" height="10" rx="2"/>
+      <path d="M8 11V7a4 4 0 0 1 8 0v4"/>
+      <circle cx="12" cy="16" r="1.4" fill={color} stroke="none"/>
+    </svg>
+  );
+}
+function SearchGlyph({ size = 32, color = '#8B8FA6' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="10.5" cy="10.5" r="6.5"/>
+      <line x1="20" y1="20" x2="15.4" y2="15.4"/>
+    </svg>
+  );
+}
+function SproutGlyph({ size = 32, color = '#10B881' }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 21V11"/>
+      <path d="M12 11C12 7 9 5 5 5c0 4 2 7 7 7Z"/>
+      <path d="M12 13c0-3.5 2.5-5.5 6-5.5 0 3.5-2 6-6 6Z"/>
+    </svg>
+  );
+}
+
+function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500, speed = 1, parallax = false }) {
   const canvasRef = useRef(null);
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -603,21 +652,36 @@ function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500 }
     ctx.scale(dpr, dpr);
     const n = Math.max(8, Math.round((w * h) / density));
     const pts = [];
-    for (let i = 0; i < n; i++) pts.push({ x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-.5)*.12, vy:(Math.random()-.5)*.12, r: Math.random()*1.2+.4, tw: Math.random()*Math.PI*2 });
+    for (let i = 0; i < n; i++) pts.push({ x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-.5)*.12*speed, vy:(Math.random()-.5)*.12*speed, r: Math.random()*1.2+.4, tw: Math.random()*Math.PI*2 });
+    // target/current parallax offset, eased toward target each frame so the
+    // shift feels like drift rather than the field snapping to the cursor
+    let targetOx = 0, targetOy = 0, ox = 0, oy = 0;
+    const onMove = (e) => {
+      if (!parallax) return;
+      const rect = canvas.getBoundingClientRect();
+      const nx = ((e.clientX - rect.left) / (rect.width || 1)) - 0.5;
+      const ny = ((e.clientY - rect.top) / (rect.height || 1)) - 0.5;
+      targetOx = -nx * 18; targetOy = -ny * 18; // px range of drift, kept subtle
+    };
+    if (parallax) window.addEventListener('mousemove', onMove);
     let raf;
     const draw = () => {
+      ox += (targetOx - ox) * 0.04; oy += (targetOy - oy) * 0.04;
       ctx.clearRect(0, 0, w, h);
-      for (const p of pts) { p.x += p.vx; p.y += p.vy; p.tw += .02; if (p.x<0||p.x>w) p.vx*=-1; if (p.y<0||p.y>h) p.vy*=-1; }
+      ctx.save();
+      ctx.translate(ox, oy);
+      for (const p of pts) { p.x += p.vx; p.y += p.vy; p.tw += .02*speed; if (p.x<0||p.x>w) p.vx*=-1; if (p.y<0||p.y>h) p.vy*=-1; }
       for (let i = 0; i < pts.length; i++) for (let j = i+1; j < pts.length; j++) {
         const a = pts[i], b = pts[j]; const d = Math.hypot(a.x-b.x, a.y-b.y);
         if (d < 64) { ctx.strokeStyle = `rgba(${color},${.12*(1-d/64)})`; ctx.lineWidth = .6; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
       }
       for (const p of pts) { const a = .35+.4*Math.sin(p.tw); ctx.fillStyle = `rgba(${color},${a})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); }
+      ctx.restore();
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, [color, density]);
+    return () => { cancelAnimationFrame(raf); if (parallax) window.removeEventListener('mousemove', onMove); };
+  }, [color, density, speed, parallax]);
   return <canvas ref={canvasRef} style={{ position:'absolute', inset:0, width:'100%', height:'100%', opacity }} />;
 }
 
@@ -823,6 +887,9 @@ export default function KindredApp() {
   // regardless of answer). dataSharingConsent is the actual current value,
   // shown/editable later in Settings.
   const [dataSharingConsent, setDataSharingConsent] = useState(false);
+  // Opt-in email notifications (default off, mirrors the DB default). Set
+  // from the user row on session load, toggled in Settings.
+  const [emailNotifications, setEmailNotifications] = useState(false);
   const [consentPrompted, setConsentPrompted] = useState(true); // default true so it never flashes before real data loads
   const [showConsentModal, setShowConsentModal] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
@@ -834,6 +901,17 @@ export default function KindredApp() {
   // bell can stay hidden until we actually know there's nothing to show).
   const [notifications, setNotifications] = useState(null);
   const [showNotifInbox, setShowNotifInbox] = useState(false);
+
+  // Daily rating streak — shared identity with the Discord bot. Both
+  // platforms read/write the SAME users.streak_count / last_streak_date
+  // columns with the SAME date rules, so a user's streak is one consistent
+  // number whether they rated on the web or in Discord that day. Null
+  // until the session loads, so the Passport doesn't flash a 0 before real
+  // data arrives.
+  const [streakCount, setStreakCount] = useState(null);
+  // How many people this user has successfully referred — shown in the
+  // invite UI as social proof / progress. Loaded from the user row.
+  const [referralCount, setReferralCount] = useState(0);
 
   const [recs, setRecs] = useState(null);
   const [aiFallbackRecs, setAiFallbackRecs] = useState([]);
@@ -850,6 +928,24 @@ export default function KindredApp() {
   // row in `users` by that UUID to get the int8 id everything else uses.
   useEffect(() => {
     let active = true;
+
+    // Capture a referral param (?ref=<referrerUserId>) on first load and
+    // stash it in sessionStorage. This has to survive the magic-link round
+    // trip: the user lands here with ?ref=, but the account row isn't
+    // created until AFTER they click the email link and come back — by
+    // which point the original URL params are long gone. sessionStorage
+    // bridges that gap (persists across the redirect within the same tab/
+    // session, clears when the tab closes). Stored as a plain string; it's
+    // validated server-side at credit time, so a junk value just fails to
+    // credit rather than causing harm. We don't overwrite an existing
+    // stashed ref, so the FIRST referral link someone arrives through wins.
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const ref = params.get('ref');
+      if (ref && /^\d+$/.test(ref) && !sessionStorage.getItem('kindred_ref')) {
+        sessionStorage.setItem('kindred_ref', ref);
+      }
+    } catch (e) { /* sessionStorage unavailable (rare) — referral just won't attribute */ }
 
     async function getUserRowByAuthId(authId) {
       const { data } = await supabase.from('users').select('*').eq('auth_id', authId).maybeSingle();
@@ -871,6 +967,9 @@ export default function KindredApp() {
         setDiscordLinked(!!row.discord_id);
         setDataSharingConsent(!!row.data_sharing_consent);
         setConsentPrompted(!!row.data_sharing_consent_prompted);
+        setStreakCount(row.streak_count || 0);
+        setEmailNotifications(!!row.email_notifications);
+        setReferralCount(row.referral_count || 0);
         const { data: saved } = await supabase.from('tastes').select('category, item_name, rating, source_id').eq('user_id', row.id);
         if (saved && saved.length) {
           const loaded = { film:{}, games:{}, books:{} };
@@ -958,6 +1057,50 @@ export default function KindredApp() {
     try { await supabase.from('users').update({ last_active_at: new Date().toISOString() }).eq('id', uid); } catch (e) {}
   }
 
+  // ─── DAILY STREAK (shared with the Discord bot) ──────────────
+  // These three helpers are a byte-for-byte port of the bot's streak
+  // logic (todayUTC / daysBetweenUTC / computeStreakAfterRating). They
+  // MUST stay identical to the bot's versions — both platforms operate on
+  // the same users.streak_count / last_streak_date columns, so if the date
+  // rules diverged, a user rating on web vs Discord on the same day could
+  // produce two different streak values for the same account. UTC date
+  // strings, same as the bot, to sidestep timezone/DST drift.
+  function streakTodayUTC() {
+    return new Date().toISOString().slice(0, 10);
+  }
+  function streakDaysBetween(fromDateStr, toDateStr) {
+    const a = new Date(`${fromDateStr}T00:00:00Z`).getTime();
+    const b = new Date(`${toDateStr}T00:00:00Z`).getTime();
+    return Math.round((b - a) / 86400000);
+  }
+  function computeStreakAfterRating(count, lastStreakDate, today) {
+    if (!lastStreakDate) return 1;
+    const gap = streakDaysBetween(lastStreakDate, today);
+    if (gap <= 0) return count;       // already counted today
+    if (gap === 1) return count + 1;  // consecutive
+    if (gap === 2) return count + 1;  // one grace day — still continues
+    return 1;                         // missed 2+ days — reset
+  }
+  // Advance the streak after a rating. Reads the current stored values
+  // fresh (rather than trusting React state, which could be stale if the
+  // user rated on Discord since this page loaded), applies the same rules
+  // as the bot, writes only when something changed, and updates the local
+  // streakCount so the Passport reflects it immediately. Fire-and-forget
+  // from setRating's perspective — never blocks the rating itself.
+  async function advanceStreak(uid) {
+    try {
+      const today = streakTodayUTC();
+      const { data: row } = await supabase
+        .from('users').select('streak_count, last_streak_date').eq('id', uid).maybeSingle();
+      const current = row?.streak_count || 0;
+      const lastDate = row?.last_streak_date || null;
+      const next = computeStreakAfterRating(current, lastDate, today);
+      if (next === current && lastDate === today) { setStreakCount(current); return; }
+      await supabase.from('users').update({ streak_count: next, last_streak_date: today }).eq('id', uid);
+      setStreakCount(next);
+    } catch (e) { /* non-critical — streak just doesn't advance this round */ }
+  }
+
   // "Your twin changed" V1 inbox. This is a plain SELECT of the user's own
   // notifications, no service-role endpoint needed here — reading your own
   // rows is exactly what the normal self-only RLS policy already allows.
@@ -1014,6 +1157,16 @@ export default function KindredApp() {
     setAuthError(null);
     setAuthLoading(true);
     try {
+      // Pull the stashed referral (if any) captured at first load. Validated
+      // again here as digits-only; anything else is ignored. We do NOT set
+      // referred_by directly in this insert — instead we pass it to the
+      // credit-referral endpoint, which sets it server-side under the
+      // service role AND increments the referrer atomically with its own
+      // anti-abuse checks (self-referral, referrer-exists, no double-credit).
+      // Setting it here too would risk crediting without the guards.
+      let stashedRef = null;
+      try { stashedRef = sessionStorage.getItem('kindred_ref'); } catch (e) {}
+
       const { data: created, error } = await supabase.from('users').insert({
         auth_id: pendingAuthUser.id,
         email: pendingAuthUser.email,
@@ -1023,6 +1176,21 @@ export default function KindredApp() {
       if (error) throw error;
       logEvent(created.id, 'signup_completed');
       touchLastActive(created.id);
+
+      // Credit the referrer (fire-and-forget). The endpoint self-guards
+      // against self-referral and double-crediting, so even if this somehow
+      // ran twice it's safe. Clear the stash either way so a later signup in
+      // the same tab can't reuse a stale ref.
+      if (stashedRef && /^\d+$/.test(stashedRef) && String(stashedRef) !== String(created.id)) {
+        fetch('/api/credit-referral', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ newUserId: created.id, referrerId: Number(stashedRef) }),
+        }).catch(() => {});
+        logEvent(created.id, 'referral_signup', stashedRef);
+      }
+      try { sessionStorage.removeItem('kindred_ref'); } catch (e) {}
+
       setUserId(created.id);
       setStep('quiz');
     } catch (e) {
@@ -1064,6 +1232,19 @@ export default function KindredApp() {
       await supabase.from('users').update({ data_sharing_consent: consent }).eq('id', userId);
       logEvent(userId, 'data_sharing_consent_changed', consent ? 'on' : 'off');
     } catch (e) { setAuthError('Could not update that setting. Try again.'); }
+  }
+
+  // Opt-in email notifications toggle. Optimistic update, reverts the UI if
+  // the write fails so the toggle never shows a state that didn't persist.
+  async function toggleEmailNotifications(enabled) {
+    setEmailNotifications(enabled);
+    try {
+      await supabase.from('users').update({ email_notifications: enabled }).eq('id', userId);
+      logEvent(userId, 'email_notifications_changed', enabled ? 'on' : 'off');
+    } catch (e) {
+      setEmailNotifications(!enabled); // revert
+      setAuthError('Could not update that setting. Try again.');
+    }
   }
 
   async function generateLinkCode() {
@@ -1202,6 +1383,10 @@ export default function KindredApp() {
       // Keep the archetype on file fresh so Tier 3 (archetype trending) has
       // accurate data for this user going forward. Fire-and-forget.
       saveArchetypeForUser(userId, nextRatings);
+      // Advance the daily streak (any rating counts, same as the bot).
+      // Fire-and-forget — a streak write failing must never affect the
+      // rating the user just made.
+      advanceStreak(userId);
       // "Your twin changed" V1 — only trigger: am I anyone's #1 Taste
       // Neighbor, and did I just rate something 4-5★ that they haven't
       // rated yet? Routed through a serverless endpoint (not a direct
@@ -1383,6 +1568,39 @@ export default function KindredApp() {
     supabase.from('tastes').select('user_id, category, item_name, rating')
       .then(({ data, error }) => { if (!error && data) setRadarTastes(data); });
   }, [step]);
+
+  // INVITE — shares a personal referral link. This is the growth loop:
+  // the link carries ?ref=<this user's id>, so when someone signs up
+  // through it, credit-referral attributes it back here. Uses the native
+  // share sheet on mobile (the high-conversion path) and falls back to
+  // copying the link on desktop/unsupported browsers. Fired at the
+  // highest-intent moment — when a user has no twins yet and the app has
+  // just told them more people rating is the fix.
+  async function inviteFriend() {
+    if (!userId) return;
+    logEvent(userId, 'invite_shared');
+    const url = `https://kindredmatch.co/?ref=${userId}`;
+    const text = `I'm on Kindred finding my taste twin — someone whose taste in movies, shows, books and games matches mine so closely their favorites become my next favorites. Join me: ${url}`;
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: 'Join me on Kindred', text, url });
+        setCopiedId('invite');
+        setTimeout(() => setCopiedId(null), 2500);
+        return;
+      }
+    } catch (e) {
+      // User cancelled the share sheet — not an error, just stop here.
+      if (e && e.name === 'AbortError') return;
+    }
+    // Fallback: copy the link to clipboard.
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedId('invite');
+      setTimeout(() => setCopiedId(null), 2500);
+    } catch (e) {
+      setAuthError('Could not open the share sheet. Your invite link is: ' + url);
+    }
+  }
 
   async function sharePassport(level, archetype, total) {
     const archetypeLabel = `${archetype.category} ${archetype.behavior}`;
@@ -1568,17 +1786,38 @@ Return ONLY a JSON object, no markdown, no backticks:
     @keyframes spin{to{transform:rotate(360deg)}}
     @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
     @keyframes slideIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+    @keyframes logoPulse{0%,100%{opacity:1}50%{opacity:0.55}}
+    @keyframes btnGlow{0%,100%{box-shadow:0 0 0 0 rgba(108,93,211,0)}50%{box-shadow:0 0 18px 2px rgba(108,93,211,0.45)}}
+    @keyframes gradientSweep{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+    @keyframes wordmarkFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+    @keyframes ringPulse{0%{box-shadow:0 0 0 0 rgba(108,93,211,0.35)}100%{box-shadow:0 0 0 8px rgba(108,93,211,0)}}
     .k-btn:hover{background:#5d4fc0!important;transform:translateY(-1px)}
     .k-out:hover{border-color:rgba(255,255,255,0.2)!important;color:#F1F5F9!important}
     .k-tab:hover{border-color:rgba(255,255,255,0.15)!important}
     .k-result:hover{border-color:rgba(255,255,255,0.15)!important;background:rgba(255,255,255,0.06)!important}
     .k-star:hover{transform:scale(1.2)!important}
+    .k-star:active{transform:scale(1.35)!important;transition:transform 0.08s!important}
     .k-twin:hover{border-color:rgba(108,93,211,0.3)!important;transform:translateY(-2px)}
     .k-rec:hover{border-color:rgba(108,93,211,0.25)!important}
     .slide-in{animation:slideIn 0.4s ease forwards}
     .fade-up{animation:fadeUp 0.4s ease forwards}
+    .fade-up-delay-1{opacity:0;animation:fadeUp 0.5s ease forwards;animation-delay:0.1s}
+    .fade-up-delay-2{opacity:0;animation:fadeUp 0.5s ease forwards;animation-delay:0.22s}
+    .fade-up-delay-3{opacity:0;animation:fadeUp 0.5s ease forwards;animation-delay:0.34s}
+    .k-logo-r{display:inline-block;animation:logoPulse 3.4s ease-in-out infinite}
+    .k-btn-glow:hover{animation:btnGlow 1.8s ease-in-out infinite}
     .k-input:focus{border-color:#6C5DD3!important;outline:none}
     .k-search:focus{border-color:#6C5DD3!important;outline:none}
+    .k-hero-gradient{background:linear-gradient(90deg,${G.purple},${G.pink},${G.purpleLight},${G.purple});background-size:300% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent;animation:gradientSweep 6s ease-in-out infinite;font-style:italic}
+    .k-wordmark{display:inline-block;animation:wordmarkFloat 5s ease-in-out infinite}
+    .k-word-reveal{display:inline-block;opacity:0;animation:fadeUp 0.55s ease forwards}
+    .k-input-glow:focus{animation:ringPulse 1.4s ease-out 1}
+    @keyframes twinReveal{from{opacity:0;transform:translateY(18px) scale(0.97)}to{opacity:1;transform:translateY(0) scale(1)}}
+    @keyframes posterFadeIn{from{opacity:0}to{opacity:1}}
+    @keyframes barShimmer{0%{background-position:-120px 0}100%{background-position:120px 0}}
+    .k-twin-reveal{opacity:0;animation:twinReveal 0.55s cubic-bezier(.2,.8,.2,1) forwards}
+    .k-poster{animation:posterFadeIn 0.35s ease forwards}
+    .k-progress-shimmer{background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.35) 50%,rgba(255,255,255,0) 100%);background-size:120px 100%;animation:barShimmer 1.6s linear infinite}
   `;
 
   // ─── WELCOME ───────────────────────────────────────────────
@@ -1596,13 +1835,24 @@ Return ONLY a JSON object, no markdown, no backticks:
   if (step === 'welcome') return (
     <div style={{...s.app,position:'relative',overflow:'hidden'}}>
       <style>{FONTS+css}</style>
-      <ConstellationBg color="108,93,211" opacity={0.35} density={5000} />
+      <ConstellationBg color="108,93,211" opacity={0.5} density={3200} speed={1.6} parallax />
+      <div style={{
+        position:'absolute', top:'18%', left:'50%', transform:'translateX(-50%)',
+        width:560, height:560, borderRadius:'50%', pointerEvents:'none',
+        background:`radial-gradient(circle, rgba(108,93,211,0.16) 0%, rgba(255,104,157,0.06) 45%, transparent 72%)`,
+        filter:'blur(2px)',
+      }}/>
       <div style={{...s.center,position:'relative'}}>
-        <div style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'2rem',fontWeight:500,marginBottom:'2.5rem',letterSpacing:'0.06em'}}>
-          Kind<span style={{color:G.purple}}>r</span>ed
+        <div className="fade-up" style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'2rem',fontWeight:500,marginBottom:'2.5rem',letterSpacing:'0.06em'}}>
+          <span className="k-wordmark">Kind<span className="k-logo-r" style={{color:G.purple}}>r</span>ed</span>
         </div>
-        <h1 style={s.h1}>Find your<br/><em style={{color:G.purple,fontStyle:'italic'}}>taste twin.</em></h1>
-        <p style={{color:G.muted,lineHeight:1.75,fontSize:'1rem',maxWidth:460,margin:'0 auto 2.25rem'}}>
+        <h1 className="fade-up-delay-1" style={s.h1}>
+          <span className="k-word-reveal" style={{animationDelay:'0.1s'}}>Find</span>{' '}
+          <span className="k-word-reveal" style={{animationDelay:'0.2s'}}>your</span>
+          <br/>
+          <em className="k-hero-gradient" style={{fontStyle:'italic'}}>taste twin.</em>
+        </h1>
+        <p className="fade-up-delay-2" style={{color:G.muted,lineHeight:1.75,fontSize:'1rem',maxWidth:460,margin:'0 auto 2.25rem'}}>
           Someone who actually gets your taste in movies, shows, books, and games. Get recommendations from them, not an algorithm.
         </p>
 
@@ -1614,12 +1864,12 @@ Return ONLY a JSON object, no markdown, no backticks:
             <button onClick={()=>setLinkSent(false)} style={{background:'none',border:'none',color:G.dim,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',textDecoration:'underline'}}>Use a different email</button>
           </div>
         ) : (
-          <div style={{maxWidth:340,width:'100%'}}>
-            <input className="k-input" style={s.input} type="email" placeholder="your@email.com"
+          <div className="fade-up-delay-3" style={{maxWidth:340,width:'100%'}}>
+            <input className="k-input k-input-glow" style={{...s.input,background:'rgba(255,255,255,0.06)',backdropFilter:'blur(10px)',WebkitBackdropFilter:'blur(10px)',border:'1px solid rgba(255,255,255,0.14)',boxShadow:'inset 0 1px 0 rgba(255,255,255,0.08)'}} type="email" placeholder="your@email.com"
               value={email} onChange={e=>setEmail(e.target.value)}
               onKeyDown={e=>e.key==='Enter'&&requestMagicLink()} />
             {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
-            <button className="k-btn" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
+            <button className="k-btn k-btn-glow" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
               onClick={requestMagicLink} disabled={authLoading}>
               {authLoading ? 'Sending...' : 'Send me a sign-in link →'}
             </button>
@@ -1764,7 +2014,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                     borderRadius:12,padding:'0.75rem 1rem',display:'flex',alignItems:'center',gap:'0.875rem',
                     transition:'all 0.2s',cursor:'default'
                   }}>
-                    {item.poster && <img src={item.poster} alt="" style={{width:36,height:52,objectFit:'cover',borderRadius:4,flexShrink:0}} onError={e=>e.target.style.display='none'} />}
+                    {item.poster && <img src={item.poster} alt="" className="k-poster" style={{width:36,height:52,objectFit:'cover',borderRadius:4,flexShrink:0,background:G.deep}} onError={e=>e.target.style.display='none'} />}
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontWeight:500,fontSize:'0.88rem',marginBottom:'0.15rem'}}>{item.title}</div>
                       <div style={{color:G.dim,fontSize:'0.72rem'}}>
@@ -2185,6 +2435,11 @@ Return ONLY a JSON object, no markdown, no backticks:
 
               {radarAxes.length > 0 ? (
                 <div style={{position:'relative',height:220,marginTop:'0.5rem'}}>
+                  <div style={{
+                    position:'absolute', top:'50%', left:'50%', transform:'translate(-50%,-50%)',
+                    width:230, height:230, borderRadius:'50%', pointerEvents:'none',
+                    background:'radial-gradient(circle, rgba(108,93,211,0.22) 0%, rgba(108,93,211,0.06) 55%, transparent 75%)',
+                  }}/>
                   <PassportRadar axes={radarAxes} size={260} />
                 </div>
               ) : (
@@ -2224,6 +2479,15 @@ Return ONLY a JSON object, no markdown, no backticks:
             <p style={{color:G.dim,fontSize:'0.72rem',margin:0,textAlign:'center'}}>
               {fresh.remaining===0 ? 'Your profile is fresh!' : `Rate ${fresh.remaining} more thing${fresh.remaining===1?'':'s'} to refresh it.`}
             </p>
+            {(streakCount || 0) >= 2 && (
+              <div style={{marginTop:'1rem',display:'flex',alignItems:'center',justifyContent:'center',gap:'0.4rem'}}>
+                <span style={{fontSize:'0.95rem'}}>🔥</span>
+                <span style={{fontFamily:'Space Mono,monospace',fontSize:'0.78rem',color:G.amber,fontWeight:600}}>
+                  {streakCount}-day streak
+                </span>
+                <span style={{fontSize:'0.66rem',color:G.dim}}>· rate today to keep it</span>
+              </div>
+            )}
           </div>
 
           <button onClick={()=>sharePassport(level,archetype,total)} style={{width:'100%',background:G.pink,color:'#1a0a12',border:'none',borderRadius:14,padding:'0.9rem',fontSize:'0.92rem',fontWeight:600,cursor:'pointer',fontFamily:'Inter,sans-serif',marginBottom:'1.5rem',transition:'all 0.2s'}}>
@@ -2300,6 +2564,21 @@ Return ONLY a JSON object, no markdown, no backticks:
             </div>
           </div>
 
+          {/* Email notifications — opt-in (default off). When on, the
+              /api/notify-twins endpoint emails the user when their #1 Taste
+              Neighbor rates something new, in addition to the in-app inbox. */}
+          <div style={{...s.card,marginBottom:'1rem'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div>
+                <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.6rem',color:G.dim,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'0.3rem'}}>Email Updates</div>
+                <p style={{color:G.muted,fontSize:'0.78rem',margin:0,maxWidth:240}}>Get an email when your #1 Taste Neighbor rates something new.</p>
+              </div>
+              <button onClick={()=>toggleEmailNotifications(!emailNotifications)} style={{flexShrink:0,width:44,height:26,borderRadius:13,border:'none',cursor:'pointer',background:emailNotifications?G.purple:G.border,position:'relative',transition:'background 0.2s'}}>
+                <span style={{position:'absolute',top:3,left:emailNotifications?22:3,width:20,height:20,borderRadius:'50%',background:'#fff',transition:'left 0.2s'}}/>
+              </button>
+            </div>
+          </div>
+
           {/* Support + account deletion — grouped as the two "control your
               data" actions, per the handoff's placement instruction. */}
           <div style={{...s.card,marginBottom:'1rem'}}>
@@ -2344,14 +2623,14 @@ Return ONLY a JSON object, no markdown, no backticks:
         <div style={s.app}>
           <style>{FONTS+css}</style>
           <div style={s.center}>
-            <div style={{fontSize:'2.5rem',marginBottom:'1.25rem'}}>🔒</div>
+            <div style={{marginBottom:'1.25rem',display:'flex',justifyContent:'center'}}><LockGlyph size={42} color={G.dim} /></div>
             <h2 style={s.h2}>Your first twin is close</h2>
             <p style={{color:G.muted,fontSize:'0.9rem',lineHeight:1.7,maxWidth:380,margin:'0 auto 1.75rem'}}>
               Rate {remaining} more thing{remaining===1?'':'s'} to unlock your first twin. We hold off until there's enough signal for a match that actually feels right.
             </p>
             <div style={{maxWidth:280,width:'100%',margin:'0 auto 1.75rem'}}>
               <div style={{height:5,background:'rgba(255,255,255,0.06)',borderRadius:3,overflow:'hidden'}}>
-                <div style={{height:'100%',width:`${Math.round((totalNow/TWIN_UNLOCK_THRESHOLD)*100)}%`,background:G.cyan,borderRadius:3,transition:'width 0.6s ease'}}/>
+                <div className="k-progress-shimmer" style={{height:'100%',width:`${Math.round((totalNow/TWIN_UNLOCK_THRESHOLD)*100)}%`,background:G.cyan,borderRadius:3,transition:'width 0.6s ease',position:'relative'}}/>
               </div>
               <p style={{color:G.dim,fontSize:'0.72rem',marginTop:'0.5rem'}}>{totalNow} / {TWIN_UNLOCK_THRESHOLD} rated</p>
             </div>
@@ -2386,15 +2665,23 @@ Return ONLY a JSON object, no markdown, no backticks:
           )}
           {!twinsLoading && !twinsError && realTwins && realTwins.length === 0 && (
             <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
-              <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🔍</div>
+              <div style={{marginBottom:'0.75rem',display:'flex',justifyContent:'center'}}><SearchGlyph size={32} color={G.dim} /></div>
               <div style={{fontWeight:500,marginBottom:'0.5rem'}}>No taste twins yet</div>
-              <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody else has rated the same titles as you yet. Share Kindred with friends, since the more people who rate, the better the matches.</p>
+              <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6,marginBottom:'1.1rem'}}>Nobody else has rated the same titles as you yet. Invite a friend — the more people who rate, the better your matches get, and you'll both be matchable.</p>
+              <button onClick={inviteFriend} style={{width:'100%',background:G.pink,color:'#1a0a12',border:'none',borderRadius:12,padding:'0.8rem',fontSize:'0.88rem',fontWeight:600,cursor:'pointer',fontFamily:'Inter,sans-serif',transition:'all 0.2s'}}>
+                {copiedId==='invite' ? '✓ Invite link ready' : '✦ Invite a friend'}
+              </button>
+              {(referralCount || 0) > 0 && (
+                <p style={{color:G.dim,fontSize:'0.72rem',marginTop:'0.75rem',marginBottom:0}}>
+                  You've invited {referralCount} friend{referralCount===1?'':'s'} so far 🎉
+                </p>
+              )}
             </div>
           )}
           {!twinsLoading && realTwins && realTwins.length > 0 && (
             <div style={{display:'flex',flexDirection:'column',gap:'1.25rem',marginBottom:'1.25rem'}}>
-              {realTwins.map(twin => (
-                <div key={twin.id} className="k-twin" style={{borderRadius:20,transition:'all 0.2s'}}>
+              {realTwins.map((twin, twinIdx) => (
+                <div key={twin.id} className="k-twin k-twin-reveal" style={{borderRadius:20,transition:'all 0.2s',animationDelay:`${twinIdx*0.12}s`}}>
                   <div style={{position:'relative',border:`1px solid ${G.border}`,borderRadius:'20px 20px 0 0',overflow:'hidden',background:`linear-gradient(180deg, ${G.deep}, ${G.bg})`,borderBottom:'none'}}>
                     <ConstellationBg color="255,104,157" opacity={0.3} density={9000} />
                     <div style={{position:'absolute',top:12,left:12,width:12,height:12,borderTop:'1px solid #46465a',borderLeft:'1px solid #46465a'}}/>
@@ -2408,7 +2695,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                           <span style={{fontFamily:"'Cormorant Garamond',serif",fontSize:'1.7rem',color:'#fff'}}>{twin.handle?.replace('@','')[0]?.toUpperCase() || '?'}</span>
                         </div>
                         <div style={{fontFamily:"'Cormorant Garamond',serif",fontWeight:300,fontSize:'2.6rem',lineHeight:1,color:G.text,marginTop:'0.6rem'}}>
-                          {twin.overall}<span style={{fontSize:'1rem',color:G.pink}}>%</span>
+                          <CountUp value={twin.overall} /><span style={{fontSize:'1rem',color:G.pink}}>%</span>
                         </div>
                         <div style={{fontFamily:'Space Mono,monospace',fontSize:'0.62rem',letterSpacing:'0.28em',color:G.dim,marginTop:'0.15rem'}}>TASTE MATCH</div>
                         <div style={{fontFamily:"'Cormorant Garamond',serif",fontWeight:400,fontSize:'1.25rem',color:G.text,marginTop:'0.6rem'}}>{twin.handle}</div>
@@ -2446,7 +2733,12 @@ Return ONLY a JSON object, no markdown, no backticks:
               ))}
             </div>
           )}
-          <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('recs')}>Get AI Recommendations →</button>
+          <button className="k-btn" style={{...s.btn,transition:'all 0.2s'}} onClick={()=>setStep('recs')}>See my recommendations →</button>
+          {realTwins && realTwins.length > 0 && (
+            <button onClick={inviteFriend} style={{width:'100%',background:'transparent',border:`1px solid ${G.border}`,color:G.muted,borderRadius:12,padding:'0.75rem',fontSize:'0.83rem',cursor:'pointer',fontFamily:'inherit',marginTop:'0.75rem',transition:'all 0.2s'}}>
+              {copiedId==='invite' ? '✓ Invite link ready' : '✦ Invite a friend → more twins'}
+            </button>
+          )}
         </div>
       </div>
     );
@@ -2483,6 +2775,7 @@ Return ONLY a JSON object, no markdown, no backticks:
       <div style={s.app}>
         <style>{FONTS+css}</style>
         <div style={{maxWidth:620,margin:'0 auto',padding:'2.5rem 1.5rem'}} className="slide-in">
+          <button onClick={()=>setStep('twins')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.78rem',cursor:'pointer',fontFamily:'inherit',marginBottom:'1.25rem',padding:0}}>← Back to twins</button>
           <div style={{marginBottom:'1.5rem'}}>
             <div style={{...s.eyebrow,color:G.dim,marginBottom:0}}>FOR YOU</div>
             <h2 style={{...s.h2,marginBottom:'0.5rem'}}>Recommendations</h2>
@@ -2533,7 +2826,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                             } : {...s.card,transition:'all 0.2s'}}>
                               <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
                                 {rec.poster ? (
-                                  <img src={rec.poster} alt="" style={{width:isHero?64:42,height:rec.type==='game'?(isHero?44:28):(isHero?90:60),objectFit:'cover',borderRadius:8,flexShrink:0,background:G.deep}}/>
+                                  <img src={rec.poster} alt="" className="k-poster" style={{width:isHero?64:42,height:rec.type==='game'?(isHero?44:28):(isHero?90:60),objectFit:'cover',borderRadius:8,flexShrink:0,background:G.deep}}/>
                                 ) : (
                                   <span style={{fontSize:isHero?'2rem':'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
                                 )}
@@ -2559,7 +2852,7 @@ Return ONLY a JSON object, no markdown, no backticks:
               })()}
               {!hasRealRecs && aiFallbackRecs && aiFallbackRecs.length === 0 && (
                 <div style={{...s.card,textAlign:'center',marginBottom:'1.25rem'}}>
-                  <div style={{fontSize:'1.75rem',marginBottom:'0.75rem'}}>🌱</div>
+                  <div style={{marginBottom:'0.75rem',display:'flex',justifyContent:'center'}}><SproutGlyph size={32} color={G.green} /></div>
                   <div style={{fontWeight:500,marginBottom:'0.5rem'}}>Your taste network is still growing</div>
                   <p style={{color:G.muted,fontSize:'0.83rem',lineHeight:1.6}}>Nobody with overlapping taste has rated enough yet. Rate a few more things or share Kindred with friends, since real recs come from real people here.</p>
                 </div>
@@ -2578,7 +2871,7 @@ Return ONLY a JSON object, no markdown, no backticks:
                         <div key={i} className="k-rec" style={{...s.card,border:`1px dashed ${G.border}`,transition:'all 0.2s'}}>
                           <div style={{display:'flex',gap:'1rem',alignItems:'flex-start'}}>
                             {rec.poster ? (
-                              <img src={rec.poster} alt="" style={{width:42,height:rec.type==='game'?28:60,objectFit:'cover',borderRadius:6,flexShrink:0,background:G.deep}}/>
+                              <img src={rec.poster} alt="" className="k-poster" style={{width:42,height:rec.type==='game'?28:60,objectFit:'cover',borderRadius:6,flexShrink:0,background:G.deep}}/>
                             ) : (
                               <span style={{fontSize:'1.5rem',flexShrink:0,paddingTop:'0.05rem'}}>{cfg.icon}</span>
                             )}

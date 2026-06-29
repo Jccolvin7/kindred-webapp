@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Kindred</title>
+    <style>
+      /* Reset the browser's default body margin (8px) and guard against
+         overflow site-wide. Without this, the default white page
+         background shows through along the edges on every screen.
+
+         Two separate issues, both stemming from the same root cause
+         (no height/width chain from html -> body -> #root):
+
+         1. LEFT/RIGHT: default 8px body margin exposed the white page
+            background along the sides, most visible on narrow mobile
+            viewports. Fixed by margin:0 + overflow-x:hidden below.
+
+         2. TOP/BOTTOM (mobile specifically): 100vh on the React root is
+            calculated against the LARGEST possible viewport (Safari's
+            toolbars hidden), but the page can render while toolbars are
+            visible -- a smaller actual visible area. If html/body don't
+            also span the full height, the gap shows as white bands above
+            and below the dark content. Fixed by chaining height:100%
+            through html/body/#root instead of depending on 100vh
+            anywhere, AND setting a dark background directly on html/body
+            so even a transient mismatch during toolbar show/hide reveals
+            dark, not white. */
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow-x: hidden;
+        background: #0D0D14; /* matches G.bg in kindred-app.jsx -- belt
+                                 and suspenders so any momentary gap during
+                                 mobile toolbar show/hide is dark, never
+                                 white, on phone, iPad, or desktop alike */
+      }
+      #root {
+        width: 100%;
+        min-height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

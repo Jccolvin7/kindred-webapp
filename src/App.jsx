@@ -644,18 +644,31 @@ function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500, 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.offsetWidth, h = canvas.offsetHeight;
-    if (!w || !h) return;
-    canvas.width = w * dpr; canvas.height = h * dpr;
-    const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    const n = Math.max(8, Math.round((w * h) / density));
-    const pts = [];
-    for (let i = 0; i < n; i++) pts.push({ x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-.5)*.12*speed, vy:(Math.random()-.5)*.12*speed, r: Math.random()*1.2+.4, tw: Math.random()*Math.PI*2 });
-    // target/current parallax offset, eased toward target each frame so the
-    // shift feels like drift rather than the field snapping to the cursor
+    let raf, resizeTimer;
+    let w, h, pts;
     let targetOx = 0, targetOy = 0, ox = 0, oy = 0;
+
+    const ctx = canvas.getContext('2d');
+
+    // Re-measures the canvas's actual on-screen size and rebuilds the
+    // point field to match. Called on mount AND on resize/orientation
+    // change -- without this, rotating a phone/iPad or resizing a
+    // desktop window leaves the canvas's internal pixel buffer stuck at
+    // its original dimensions, stretching or cropping the constellation
+    // relative to its CSS box.
+    const setup = () => {
+      const dpr = window.devicePixelRatio || 1;
+      w = canvas.offsetWidth; h = canvas.offsetHeight;
+      if (!w || !h) return;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+      const n = Math.max(8, Math.round((w * h) / density));
+      pts = [];
+      for (let i = 0; i < n; i++) pts.push({ x: Math.random()*w, y: Math.random()*h, vx:(Math.random()-.5)*.12*speed, vy:(Math.random()-.5)*.12*speed, r: Math.random()*1.2+.4, tw: Math.random()*Math.PI*2 });
+    };
+    setup();
+
     const onMove = (e) => {
       if (!parallax) return;
       const rect = canvas.getBoundingClientRect();
@@ -664,23 +677,42 @@ function ConstellationBg({ color = '108,93,211', opacity = 0.4, density = 6500, 
       targetOx = -nx * 18; targetOy = -ny * 18; // px range of drift, kept subtle
     };
     if (parallax) window.addEventListener('mousemove', onMove);
-    let raf;
+
+    // Debounced so a rapid sequence of resize events (orientation change
+    // on mobile/tablet fires several in quick succession) doesn't rebuild
+    // the point field dozens of times in a row.
+    const onResize = () => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(setup, 150);
+    };
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+
     const draw = () => {
-      ox += (targetOx - ox) * 0.04; oy += (targetOy - oy) * 0.04;
-      ctx.clearRect(0, 0, w, h);
-      ctx.save();
-      ctx.translate(ox, oy);
-      for (const p of pts) { p.x += p.vx; p.y += p.vy; p.tw += .02*speed; if (p.x<0||p.x>w) p.vx*=-1; if (p.y<0||p.y>h) p.vy*=-1; }
-      for (let i = 0; i < pts.length; i++) for (let j = i+1; j < pts.length; j++) {
-        const a = pts[i], b = pts[j]; const d = Math.hypot(a.x-b.x, a.y-b.y);
-        if (d < 64) { ctx.strokeStyle = `rgba(${color},${.12*(1-d/64)})`; ctx.lineWidth = .6; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+      if (w && h && pts) {
+        ox += (targetOx - ox) * 0.04; oy += (targetOy - oy) * 0.04;
+        ctx.clearRect(0, 0, w, h);
+        ctx.save();
+        ctx.translate(ox, oy);
+        for (const p of pts) { p.x += p.vx; p.y += p.vy; p.tw += .02*speed; if (p.x<0||p.x>w) p.vx*=-1; if (p.y<0||p.y>h) p.vy*=-1; }
+        for (let i = 0; i < pts.length; i++) for (let j = i+1; j < pts.length; j++) {
+          const a = pts[i], b = pts[j]; const d = Math.hypot(a.x-b.x, a.y-b.y);
+          if (d < 64) { ctx.strokeStyle = `rgba(${color},${.12*(1-d/64)})`; ctx.lineWidth = .6; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+        }
+        for (const p of pts) { const a = .35+.4*Math.sin(p.tw); ctx.fillStyle = `rgba(${color},${a})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); }
+        ctx.restore();
       }
-      for (const p of pts) { const a = .35+.4*Math.sin(p.tw); ctx.fillStyle = `rgba(${color},${a})`; ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill(); }
-      ctx.restore();
       raf = requestAnimationFrame(draw);
     };
     raf = requestAnimationFrame(draw);
-    return () => { cancelAnimationFrame(raf); if (parallax) window.removeEventListener('mousemove', onMove); };
+
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(resizeTimer);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('orientationchange', onResize);
+      if (parallax) window.removeEventListener('mousemove', onMove);
+    };
   }, [color, density, speed, parallax]);
   return <canvas ref={canvasRef} style={{ position:'absolute', inset:0, width:'100%', height:'100%', opacity }} />;
 }
@@ -1838,7 +1870,7 @@ Return ONLY a JSON object, no markdown, no backticks:
       <ConstellationBg color="108,93,211" opacity={0.5} density={3200} speed={1.6} parallax />
       <div style={{
         position:'absolute', top:'18%', left:'50%', transform:'translateX(-50%)',
-        width:560, height:560, borderRadius:'50%', pointerEvents:'none',
+        width:'min(560px, 90vw)', height:'min(560px, 90vw)', borderRadius:'50%', pointerEvents:'none',
         background:`radial-gradient(circle, rgba(108,93,211,0.16) 0%, rgba(255,104,157,0.06) 45%, transparent 72%)`,
         filter:'blur(2px)',
       }}/>

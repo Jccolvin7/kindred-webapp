@@ -869,6 +869,15 @@ export default function KindredApp() {
   const [userId, setUserId] = useState(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState(null);
+  // Signup abuse protection: client-side cooldown to stop a user (or bot)
+  // from spamming the "send sign-in link" button. Without this, nothing
+  // stops repeated clicks from firing repeated signInWithOtp calls --
+  // each one sends a real email, so this is both an abuse vector and a
+  // real annoyance for whoever's inbox it is. This is a UX-layer
+  // throttle only; the actual security backstop is Supabase Auth's own
+  // server-side rate limiting (per-IP/per-email), which is a project
+  // dashboard setting, not something this file can configure.
+  const [authCooldown, setAuthCooldown] = useState(0);
   const [subscribeEmail, setSubscribeEmail] = useState(true);
   const [checkingSession, setCheckingSession] = useState(true);
   const [linkSent, setLinkSent] = useState(false);
@@ -1168,8 +1177,21 @@ export default function KindredApp() {
     try { await supabase.from('notifications').update({ read: true }).in('id', ids); } catch (e) {}
   }
 
+  // Ticks the cooldown down once a second while active. Cleans up its
+  // interval on unmount/re-trigger so this never leaks timers across
+  // re-renders or stacks multiple intervals if the effect re-fires.
+  useEffect(() => {
+    if (authCooldown <= 0) return;
+    const t = setInterval(() => setAuthCooldown(c => (c <= 1 ? 0 : c - 1)), 1000);
+    return () => clearInterval(t);
+  }, [authCooldown > 0]);
+
   async function requestMagicLink() {
     setAuthError(null);
+    if (authCooldown > 0) return; // belt-and-suspenders: button is also
+    // disabled during cooldown (see the welcome screen JSX), but this
+    // guards the function itself in case it's ever called another way
+    // (e.g. the Enter-key handler) while disabled state hasn't caught up.
     if (!email || !email.includes('@')) { setAuthError('Enter a valid email.'); return; }
     setAuthLoading(true);
     try {
@@ -1179,6 +1201,9 @@ export default function KindredApp() {
       });
       if (error) throw error;
       setLinkSent(true);
+      setAuthCooldown(30); // 30s before another send is allowed to this
+      // or any other email -- stops rapid repeat clicks from spamming
+      // real magic-link emails to whatever address is typed in.
     } catch (e) {
       setAuthError('Could not send the link. Check your connection and try again.');
     }
@@ -1901,9 +1926,9 @@ Return ONLY a JSON object, no markdown, no backticks:
               value={email} onChange={e=>setEmail(e.target.value)}
               onKeyDown={e=>e.key==='Enter'&&requestMagicLink()} />
             {authError && <div style={{color:'#FCA5A5',fontSize:'0.78rem',marginBottom:'0.75rem'}}>{authError}</div>}
-            <button className="k-btn k-btn-glow" style={{...s.btn,transition:'all 0.2s',opacity:authLoading?0.6:1}}
-              onClick={requestMagicLink} disabled={authLoading}>
-              {authLoading ? 'Sending...' : 'Send me a sign-in link →'}
+            <button className="k-btn k-btn-glow" style={{...s.btn,transition:'all 0.2s',opacity:(authLoading||authCooldown>0)?0.6:1}}
+              onClick={requestMagicLink} disabled={authLoading||authCooldown>0}>
+              {authLoading ? 'Sending...' : authCooldown>0 ? `Wait ${authCooldown}s to resend` : 'Send me a sign-in link →'}
             </button>
             <p style={{color:G.dim,fontSize:'0.7rem',marginTop:'0.75rem',lineHeight:1.5}}>
               By signing up, you agree to our <button onClick={()=>setStep('terms')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.7rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0}}>Terms</button> and <button onClick={()=>setStep('privacy')} style={{background:'none',border:'none',color:G.dim,fontSize:'0.7rem',textDecoration:'underline',cursor:'pointer',fontFamily:'inherit',padding:0}}>Privacy Policy</button>.

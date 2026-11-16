@@ -993,13 +993,38 @@ export default function KindredApp() {
       return data;
     }
 
+    // Any Supabase call that hangs (stale/expired session, network) must not
+    // leave the app on the spinner forever. Race it against a timeout.
+    const SESSION_TIMEOUT_MS = 15000;
+    function withTimeout(promise, label) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), SESSION_TIMEOUT_MS)),
+      ]);
+    }
+
+    // Fallback: drop the local session and show the sign-in screen.
+    async function fallBackToSignIn(err) {
+      console.warn('[auth] session check failed, falling back to sign-in:', err);
+      try { await supabase.auth.signOut({ scope: 'local' }); } catch (e) { /* ignore */ }
+      if (active) { setStep('welcome'); setCheckingSession(false); }
+    }
+
     async function handleSession(session) {
+      try {
+        await loadSession(session);
+      } catch (err) {
+        await fallBackToSignIn(err);
+      }
+    }
+
+    async function loadSession(session) {
       if (!session) {
         if (active) { setCheckingSession(false); setStep('welcome'); }
         return;
       }
       const authUser = session.user;
-      const row = await getUserRowByAuthId(authUser.id);
+      const row = await withTimeout(getUserRowByAuthId(authUser.id), 'profile lookup');
       if (!active) return;
       if (row) {
         setUserId(row.id);
@@ -1011,7 +1036,7 @@ export default function KindredApp() {
         setStreakCount(row.streak_count || 0);
         setEmailNotifications(!!row.email_notifications);
         setReferralCount(row.referral_count || 0);
-        const { data: saved } = await supabase.from('tastes').select('category, item_name, rating, source_id').eq('user_id', row.id);
+        const { data: saved } = await withTimeout(supabase.from('tastes').select('category, item_name, rating, source_id').eq('user_id', row.id), 'tastes load');
         if (saved && saved.length) {
           const loaded = { film:{}, games:{}, books:{} };
           const loadedBySourceId = {};
@@ -1033,8 +1058,15 @@ export default function KindredApp() {
       setCheckingSession(false);
     }
 
-    supabase.auth.getSession().then(({ data }) => handleSession(data.session));
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => handleSession(session));
+    withTimeout(supabase.auth.getSession(), 'getSession')
+      .then(({ data }) => handleSession(data.session))
+      .catch(fallBackToSignIn);
+    // Don't await Supabase calls inside this callback: supabase-js holds its
+    // auth lock while the callback runs, so querying from here deadlocks.
+    // Defer to the next tick (Supabase's documented workaround).
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setTimeout(() => handleSession(session), 0);
+    });
     return () => { active = false; listener.subscription.unsubscribe(); };
   }, []);
 

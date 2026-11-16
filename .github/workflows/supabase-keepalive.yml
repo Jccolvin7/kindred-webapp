@@ -1,0 +1,34 @@
+# Keeps the free-tier Supabase project from pausing after a week of
+# inactivity, and doubles as a health check: if the site or database is
+# down, this run fails and GitHub emails the repo owner.
+#
+# The publishable (anon) key is read from the live site's JS bundle, where
+# it is already public, so no repo secrets are needed.
+name: Supabase keep-alive
+
+on:
+  schedule:
+    - cron: '17 15 */3 * *' # every 3 days, ~7-8am Pacific
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping site and database
+        run: |
+          set -euo pipefail
+          SUPABASE_URL="https://xonalrljdmfgvykkkxnx.supabase.co"
+
+          ASSET=$(curl -fsSL https://www.kindredmatch.co/ | grep -o '/assets/index-[^"]*\.js' | head -1)
+          [ -n "$ASSET" ] || { echo "::error::Could not find JS bundle on kindredmatch.co"; exit 1; }
+
+          KEY=$(curl -fsSL "https://www.kindredmatch.co$ASSET" | grep -o 'sb_publishable_[A-Za-z0-9_-]*' | head -1)
+          [ -n "$KEY" ] || { echo "::error::Could not find Supabase publishable key in bundle"; exit 1; }
+
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
+            -H "apikey: $KEY" -H "Authorization: Bearer $KEY" \
+            "$SUPABASE_URL/rest/v1/tastes?select=user_id&limit=1")
+          echo "Supabase REST status: $STATUS"
+          [ "$STATUS" = "200" ] || { echo "::error::Supabase returned $STATUS (paused or unhealthy?)"; exit 1; }

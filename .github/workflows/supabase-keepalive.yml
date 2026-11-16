@@ -24,7 +24,7 @@ jobs:
           ASSET=$(curl -fsSL https://www.kindredmatch.co/ | grep -o '/assets/index-[^"]*\.js' | head -1)
           [ -n "$ASSET" ] || { echo "::error::Could not find JS bundle on kindredmatch.co"; exit 1; }
 
-          KEY=$(curl -fsSL "https://www.kindredmatch.co$ASSET" | grep -o 'sb_publishable_[A-Za-z0-9_-]*' | head -1)
+          KEY=$(curl -fsSL "https://www.kindredmatch.co$ASSET" | grep -oE 'sb_publishable_[A-Za-z0-9_-]{10,}' | head -1)
           [ -n "$KEY" ] || { echo "::error::Could not find Supabase publishable key in bundle"; exit 1; }
 
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 60 \
